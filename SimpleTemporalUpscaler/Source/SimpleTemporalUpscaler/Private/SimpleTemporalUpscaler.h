@@ -2,14 +2,19 @@
 
 #include "SceneViewExtension.h"
 #include "TemporalUpscaler.h"
+#include "RenderTargetPool.h"
 #include "Templates/RefCounting.h"
 
-class 111111111111111111111111 final : public UE::Renderer::Private::ITemporalUpscaler
+class FSimpleTemporalUpscaler final : public UE::Renderer::Private::ITemporalUpscaler
 {
 public:
 	class FHistory final : public UE::Renderer::Private::ITemporalUpscaler::IHistory, private FRefCountBase
 	{
 	public:
+		TRefCountPtr<IPooledRenderTarget> ColorHistory;
+		FIntRect ViewRect;
+		FIntPoint Extent = FIntPoint::ZeroValue;
+
 		virtual uint32 AddRef() const override;
 		virtual uint32 Release() const override;
 		virtual uint32 GetRefCount() const override;

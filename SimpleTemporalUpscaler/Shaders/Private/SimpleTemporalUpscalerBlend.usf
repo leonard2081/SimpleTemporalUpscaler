@@ -1,0 +1,48 @@
+#include "/Engine/Private/Common.ush"
+
+Texture2D CurrentSceneColorTexture;
+SamplerState CurrentSceneColorSampler;
+
+Texture2D PrevHistoryTexture;
+SamplerState PrevHistorySampler;
+
+RWTexture2D<float4> OutputTexture;
+
+float4 CurrentViewRect;
+float4 OutputViewRect;
+float2 CurrentTextureExtentInverse;
+float2 HistoryTextureExtentInverse;
+float HistoryWeight;
+uint bHasHistory;
+
+[numthreads(8, 8, 1)]
+void MainCS(uint3 DispatchThreadId : SV_DispatchThreadID)
+{
+	uint2 LocalOutputPixelPos = DispatchThreadId.xy;
+	uint2 OutputSize = uint2(OutputViewRect.zw);
+
+	if (any(LocalOutputPixelPos >= OutputSize))
+	{
+		return;
+	}
+
+	float2 OutputPixelCenter = float2(LocalOutputPixelPos) + 0.5;
+	float2 OutputUV = OutputPixelCenter / float2(OutputSize);
+
+	float2 CurrentPixelPos = CurrentViewRect.xy + OutputUV * CurrentViewRect.zw;
+	float2 CurrentUV = CurrentPixelPos * CurrentTextureExtentInverse;
+
+	float3 CurrentColor = CurrentSceneColorTexture.SampleLevel(CurrentSceneColorSampler, CurrentUV, 0).rgb;
+	float3 OutputColor = CurrentColor;
+
+	if (bHasHistory != 0)
+	{
+		float2 HistoryPixelPos = OutputViewRect.xy + OutputPixelCenter;
+		float2 HistoryUV = HistoryPixelPos * HistoryTextureExtentInverse;
+		float3 PrevColor = PrevHistoryTexture.SampleLevel(PrevHistorySampler, HistoryUV, 0).rgb;
+		OutputColor = lerp(CurrentColor, PrevColor, HistoryWeight);
+	}
+
+	uint2 OutputPixelPos = uint2(OutputViewRect.xy) + LocalOutputPixelPos;
+	OutputTexture[OutputPixelPos] = float4(OutputColor, 1.0);
+}

@@ -1,7 +1,11 @@
 #include "SimpleTemporalUpscalerModule.h"
 
 #include "Misc/CoreDelegates.h"
+#include "Engine/Engine.h"
+#include "Interfaces/IPluginManager.h"
+#include "Misc/Paths.h"
 #include "SceneViewExtension.h"
+#include "ShaderCore.h"
 #include "SimpleTemporalUpscaler.h"
 
 #define LOCTEXT_NAMESPACE "FSimpleTemporalUpscalerModule"
@@ -9,6 +13,12 @@
 void FSimpleTemporalUpscalerModule::StartupModule()
 {
 	UE_LOG(LogTemp, Warning, TEXT("SimpleTemporalUpscaler StartupModule"));
+
+	if (TSharedPtr<IPlugin> Plugin = IPluginManager::Get().FindPlugin(TEXT("SimpleTemporalUpscaler")))
+	{
+		const FString PluginShaderDir = FPaths::Combine(Plugin->GetBaseDir(), TEXT("Shaders"));
+		AddShaderSourceDirectoryMapping(TEXT("/Plugin/Runtime/SimpleTemporalUpscaler"), PluginShaderDir);
+	}
 
 	if (GEngine)
 	{
