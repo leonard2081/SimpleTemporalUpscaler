@@ -19,11 +19,15 @@ public:
 		SHADER_PARAMETER_SAMPLER(SamplerState, PrevHistorySampler)
 		SHADER_PARAMETER_RDG_TEXTURE(Texture2D, SceneVelocityTexture)
 		SHADER_PARAMETER_SAMPLER(SamplerState, SceneVelocitySampler)
+		SHADER_PARAMETER_RDG_TEXTURE(Texture2D, SceneDepthTexture)
+		SHADER_PARAMETER_SAMPLER(SamplerState, SceneDepthSampler)
 		SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2D<float4>, OutputTexture)
+		SHADER_PARAMETER_STRUCT_REF(FViewUniformShaderParameters, View)
 		SHADER_PARAMETER(FVector4f, CurrentViewRect)
 		SHADER_PARAMETER(FVector4f, OutputViewRect)
 		SHADER_PARAMETER(FVector2f, CurrentTextureExtentInverse)
 		SHADER_PARAMETER(FVector2f, SceneVelocityTextureExtentInverse)
+		SHADER_PARAMETER(FVector2f, SceneDepthTextureExtentInverse)
 		SHADER_PARAMETER(FVector2f, HistoryTextureExtentInverse)
 		SHADER_PARAMETER(float, HistoryWeight)
 		SHADER_PARAMETER(uint32, bHasHistory)
@@ -161,7 +165,10 @@ UE::Renderer::Private::ITemporalUpscaler::FOutputs FSimpleTemporalUpscaler::AddP
 	Parameters->PrevHistorySampler = TStaticSamplerState<SF_Bilinear>::GetRHI();
 	Parameters->SceneVelocityTexture = bUseVelocity ? Inputs.SceneVelocity.Texture : Inputs.SceneColor.Texture;
 	Parameters->SceneVelocitySampler = TStaticSamplerState<SF_Point>::GetRHI();
+	Parameters->SceneDepthTexture = Inputs.SceneDepth.Texture;
+	Parameters->SceneDepthSampler = TStaticSamplerState<SF_Point>::GetRHI();
 	Parameters->OutputTexture = GraphBuilder.CreateUAV(OutputTexture);
+	Parameters->View = View.ViewUniformBuffer;
 	Parameters->CurrentViewRect = FVector4f(
 		Inputs.SceneColor.ViewRect.Min.X,
 		Inputs.SceneColor.ViewRect.Min.Y,
@@ -178,6 +185,9 @@ UE::Renderer::Private::ITemporalUpscaler::FOutputs FSimpleTemporalUpscaler::AddP
 	Parameters->SceneVelocityTextureExtentInverse = bUseVelocity
 		? FVector2f(1.0f / Inputs.SceneVelocity.Texture->Desc.Extent.X, 1.0f / Inputs.SceneVelocity.Texture->Desc.Extent.Y)
 		: FVector2f(1.0f / Inputs.SceneColor.Texture->Desc.Extent.X, 1.0f / Inputs.SceneColor.Texture->Desc.Extent.Y);
+	Parameters->SceneDepthTextureExtentInverse = FVector2f(
+		1.0f / Inputs.SceneDepth.Texture->Desc.Extent.X,
+		1.0f / Inputs.SceneDepth.Texture->Desc.Extent.Y);
 	Parameters->HistoryTextureExtentInverse = bHasHistory
 		? FVector2f(1.0f / PrevHistoryExtent.X, 1.0f / PrevHistoryExtent.Y)
 		: FVector2f(1.0f / Inputs.SceneColor.Texture->Desc.Extent.X, 1.0f / Inputs.SceneColor.Texture->Desc.Extent.Y);

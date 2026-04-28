@@ -9,16 +9,53 @@ SamplerState PrevHistorySampler;
 Texture2D SceneVelocityTexture;
 SamplerState SceneVelocitySampler;
 
+Texture2D SceneDepthTexture;
+SamplerState SceneDepthSampler;
+
 RWTexture2D<float4> OutputTexture;
 
 float4 CurrentViewRect;
 float4 OutputViewRect;
 float2 CurrentTextureExtentInverse;
 float2 SceneVelocityTextureExtentInverse;
+float2 SceneDepthTextureExtentInverse;
 float2 HistoryTextureExtentInverse;
 float HistoryWeight;
 uint bHasHistory;
 uint bUseVelocity;
+
+float2 OutputUVToScreenPos(float2 OutputUV)
+{
+	return float2(OutputUV.x * 2.0 - 1.0, 1.0 - OutputUV.y * 2.0);
+}
+
+float2 ScreenPosToOutputUV(float2 ScreenPos)
+{
+	return float2(ScreenPos.x * 0.5 + 0.5, 0.5 - ScreenPos.y * 0.5);
+}
+
+float2 ClampPixelPosToViewRect(float2 PixelPos, float4 ViewRect)
+{
+	return clamp(PixelPos, ViewRect.xy + 0.5, ViewRect.xy + ViewRect.zw - 0.5);
+}
+
+void ComputeCurrentColorNeighborhoodMinMax(float2 CurrentPixelPos, out float3 OutMinColor, out float3 OutMaxColor)
+{
+	OutMinColor = float3(65504.0, 65504.0, 65504.0);
+	OutMaxColor = float3(-65504.0, -65504.0, -65504.0);
+
+	for (int Y = -1; Y <= 1; ++Y)
+	{
+		for (int X = -1; X <= 1; ++X)
+		{
+			float2 SamplePixelPos = ClampPixelPosToViewRect(CurrentPixelPos + float2(X, Y), CurrentViewRect);
+			float2 SampleUV = SamplePixelPos * CurrentTextureExtentInverse;
+			float3 SampleColor = CurrentSceneColorTexture.SampleLevel(CurrentSceneColorSampler, SampleUV, 0).rgb;
+			OutMinColor = min(OutMinColor, SampleColor);
+			OutMaxColor = max(OutMaxColor, SampleColor);
+		}
+	}
+}
 
 [numthreads(8, 8, 1)]
 void MainCS(uint3 DispatchThreadId : SV_DispatchThreadID)
@@ -34,7 +71,7 @@ void MainCS(uint3 DispatchThreadId : SV_DispatchThreadID)
 	float2 OutputPixelCenter = float2(LocalOutputPixelPos) + 0.5;
 	float2 OutputUV = OutputPixelCenter / float2(OutputSize);
 
-	float2 CurrentPixelPos = CurrentViewRect.xy + OutputUV * CurrentViewRect.zw;
+	float2 CurrentPixelPos = ClampPixelPosToViewRect(CurrentViewRect.xy + OutputUV * CurrentViewRect.zw, CurrentViewRect);
 	float2 CurrentUV = CurrentPixelPos * CurrentTextureExtentInverse;
 
 	float3 CurrentColor = CurrentSceneColorTexture.SampleLevel(CurrentSceneColorSampler, CurrentUV, 0).rgb;
@@ -46,15 +83,15 @@ void MainCS(uint3 DispatchThreadId : SV_DispatchThreadID)
 
 		if (bUseVelocity != 0)
 		{
+			float2 CurrentScreenPos = OutputUVToScreenPos(OutputUV);
 			float2 VelocityUV = CurrentPixelPos * SceneVelocityTextureExtentInverse;
 			float4 EncodedVelocity = SceneVelocityTexture.SampleLevel(SceneVelocitySampler, VelocityUV, 0);
 
 			if (EncodedVelocity.x > 0.0)
 			{
-				float2 CurrentScreenPos = float2(OutputUV.x * 2.0 - 1.0, 1.0 - OutputUV.y * 2.0);
 				float2 ScreenVelocity = DecodeVelocityFromTexture(EncodedVelocity).xy;
 				float2 PrevScreenPos = CurrentScreenPos - ScreenVelocity;
-				PrevOutputUV = float2(PrevScreenPos.x * 0.5 + 0.5, 0.5 - PrevScreenPos.y * 0.5);
+				PrevOutputUV = ScreenPosToOutputUV(PrevScreenPos);
 			}
 		}
 
@@ -62,9 +99,13 @@ void MainCS(uint3 DispatchThreadId : SV_DispatchThreadID)
 
 		if (bHistoryUVValid)
 		{
-			float2 HistoryPixelPos = OutputViewRect.xy + PrevOutputUV * OutputViewRect.zw;
+			float2 HistoryPixelPos = ClampPixelPosToViewRect(OutputViewRect.xy + PrevOutputUV * OutputViewRect.zw, OutputViewRect);
 			float2 HistoryUV = HistoryPixelPos * HistoryTextureExtentInverse;
 			float3 PrevColor = PrevHistoryTexture.SampleLevel(PrevHistorySampler, HistoryUV, 0).rgb;
+			float3 CurrentMinColor;
+			float3 CurrentMaxColor;
+			ComputeCurrentColorNeighborhoodMinMax(CurrentPixelPos, CurrentMinColor, CurrentMaxColor);
+			PrevColor = clamp(PrevColor, CurrentMinColor, CurrentMaxColor);
 			OutputColor = lerp(CurrentColor, PrevColor, HistoryWeight);
 		}
 	}
