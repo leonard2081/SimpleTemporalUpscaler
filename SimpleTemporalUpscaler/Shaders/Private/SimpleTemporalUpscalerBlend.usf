@@ -6,14 +6,19 @@ SamplerState CurrentSceneColorSampler;
 Texture2D PrevHistoryTexture;
 SamplerState PrevHistorySampler;
 
+Texture2D SceneVelocityTexture;
+SamplerState SceneVelocitySampler;
+
 RWTexture2D<float4> OutputTexture;
 
 float4 CurrentViewRect;
 float4 OutputViewRect;
 float2 CurrentTextureExtentInverse;
+float2 SceneVelocityTextureExtentInverse;
 float2 HistoryTextureExtentInverse;
 float HistoryWeight;
 uint bHasHistory;
+uint bUseVelocity;
 
 [numthreads(8, 8, 1)]
 void MainCS(uint3 DispatchThreadId : SV_DispatchThreadID)
@@ -35,12 +40,33 @@ void MainCS(uint3 DispatchThreadId : SV_DispatchThreadID)
 	float3 CurrentColor = CurrentSceneColorTexture.SampleLevel(CurrentSceneColorSampler, CurrentUV, 0).rgb;
 	float3 OutputColor = CurrentColor;
 
-	if (bHasHistory != 0)
+	if (bHasHistory != 0 && HistoryWeight > 0.0)
 	{
-		float2 HistoryPixelPos = OutputViewRect.xy + OutputPixelCenter;
-		float2 HistoryUV = HistoryPixelPos * HistoryTextureExtentInverse;
-		float3 PrevColor = PrevHistoryTexture.SampleLevel(PrevHistorySampler, HistoryUV, 0).rgb;
-		OutputColor = lerp(CurrentColor, PrevColor, HistoryWeight);
+		float2 PrevOutputUV = OutputUV;
+
+		if (bUseVelocity != 0)
+		{
+			float2 VelocityUV = CurrentPixelPos * SceneVelocityTextureExtentInverse;
+			float4 EncodedVelocity = SceneVelocityTexture.SampleLevel(SceneVelocitySampler, VelocityUV, 0);
+
+			if (EncodedVelocity.x > 0.0)
+			{
+				float2 CurrentScreenPos = float2(OutputUV.x * 2.0 - 1.0, 1.0 - OutputUV.y * 2.0);
+				float2 ScreenVelocity = DecodeVelocityFromTexture(EncodedVelocity).xy;
+				float2 PrevScreenPos = CurrentScreenPos - ScreenVelocity;
+				PrevOutputUV = float2(PrevScreenPos.x * 0.5 + 0.5, 0.5 - PrevScreenPos.y * 0.5);
+			}
+		}
+
+		bool bHistoryUVValid = all(PrevOutputUV >= 0.0) && all(PrevOutputUV <= 1.0);
+
+		if (bHistoryUVValid)
+		{
+			float2 HistoryPixelPos = OutputViewRect.xy + PrevOutputUV * OutputViewRect.zw;
+			float2 HistoryUV = HistoryPixelPos * HistoryTextureExtentInverse;
+			float3 PrevColor = PrevHistoryTexture.SampleLevel(PrevHistorySampler, HistoryUV, 0).rgb;
+			OutputColor = lerp(CurrentColor, PrevColor, HistoryWeight);
+		}
 	}
 
 	uint2 OutputPixelPos = uint2(OutputViewRect.xy) + LocalOutputPixelPos;

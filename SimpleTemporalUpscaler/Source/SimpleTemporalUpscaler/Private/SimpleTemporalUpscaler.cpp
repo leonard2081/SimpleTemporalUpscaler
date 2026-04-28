@@ -17,13 +17,17 @@ public:
 		SHADER_PARAMETER_SAMPLER(SamplerState, CurrentSceneColorSampler)
 		SHADER_PARAMETER_RDG_TEXTURE(Texture2D, PrevHistoryTexture)
 		SHADER_PARAMETER_SAMPLER(SamplerState, PrevHistorySampler)
+		SHADER_PARAMETER_RDG_TEXTURE(Texture2D, SceneVelocityTexture)
+		SHADER_PARAMETER_SAMPLER(SamplerState, SceneVelocitySampler)
 		SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2D<float4>, OutputTexture)
 		SHADER_PARAMETER(FVector4f, CurrentViewRect)
 		SHADER_PARAMETER(FVector4f, OutputViewRect)
 		SHADER_PARAMETER(FVector2f, CurrentTextureExtentInverse)
+		SHADER_PARAMETER(FVector2f, SceneVelocityTextureExtentInverse)
 		SHADER_PARAMETER(FVector2f, HistoryTextureExtentInverse)
 		SHADER_PARAMETER(float, HistoryWeight)
 		SHADER_PARAMETER(uint32, bHasHistory)
+		SHADER_PARAMETER(uint32, bUseVelocity)
 	END_SHADER_PARAMETER_STRUCT()
 };
 
@@ -47,6 +51,14 @@ static TAutoConsoleVariable<float> CVarSimpleTemporalUpscalerHistoryWeight(
 	TEXT("History weight for the simple temporal upscaler fixed blend.\n")
 	TEXT(" 0.0: current frame only;\n")
 	TEXT(" 1.0: history only.\n"),
+	ECVF_RenderThreadSafe);
+
+static TAutoConsoleVariable<int32> CVarSimpleTemporalUpscalerUseVelocity(
+	TEXT("r.SimpleTemporalUpscaler.UseVelocity"),
+	1,
+	TEXT("Uses the scene velocity buffer to reproject history sampling positions.\n")
+	TEXT(" 0: disabled;\n")
+	TEXT(" 1: enabled.\n"),
 	ECVF_RenderThreadSafe);
 
 static TAutoConsoleVariable<int32> CVarSimpleTemporalUpscalerLogStats(
@@ -122,11 +134,13 @@ UE::Renderer::Private::ITemporalUpscaler::FOutputs FSimpleTemporalUpscaler::AddP
 	}
 
 	const float HistoryWeight = FMath::Clamp(CVarSimpleTemporalUpscalerHistoryWeight.GetValueOnRenderThread(), 0.0f, 1.0f);
+	const bool bUseVelocity = CVarSimpleTemporalUpscalerUseVelocity.GetValueOnRenderThread() != 0 && Inputs.SceneVelocity.Texture != nullptr;
+
 	if (CVarSimpleTemporalUpscalerLogStats.GetValueOnRenderThread() != 0)
 	{
 		const float InputFractionX = float(Inputs.SceneColor.ViewRect.Width()) / float(OutputExtent.X);
 		const float InputFractionY = float(Inputs.SceneColor.ViewRect.Height()) / float(OutputExtent.Y);
-		UE_LOG(LogTemp, Warning, TEXT("SimpleTemporalUpscaler Input=%dx%d Output=%dx%d Fraction=(%.3f, %.3f) Supported=(%.3f, %.3f) HasHistory=%d HistoryWeight=%.3f"),
+		UE_LOG(LogTemp, Warning, TEXT("SimpleTemporalUpscaler Input=%dx%d Output=%dx%d Fraction=(%.3f, %.3f) Supported=(%.3f, %.3f) HasHistory=%d HistoryWeight=%.3f UseVelocity=%d"),
 			Inputs.SceneColor.ViewRect.Width(),
 			Inputs.SceneColor.ViewRect.Height(),
 			OutputExtent.X,
@@ -136,7 +150,8 @@ UE::Renderer::Private::ITemporalUpscaler::FOutputs FSimpleTemporalUpscaler::AddP
 			GetMinUpsampleResolutionFraction(),
 			GetMaxUpsampleResolutionFraction(),
 			bHasHistory ? 1 : 0,
-			HistoryWeight);
+			HistoryWeight,
+			bUseVelocity ? 1 : 0);
 	}
 
 	FSimpleTemporalUpscalerBlendCS::FParameters* Parameters = GraphBuilder.AllocParameters<FSimpleTemporalUpscalerBlendCS::FParameters>();
@@ -144,6 +159,8 @@ UE::Renderer::Private::ITemporalUpscaler::FOutputs FSimpleTemporalUpscaler::AddP
 	Parameters->CurrentSceneColorSampler = TStaticSamplerState<SF_Bilinear>::GetRHI();
 	Parameters->PrevHistoryTexture = bHasHistory ? PrevHistoryTexture : Inputs.SceneColor.Texture;
 	Parameters->PrevHistorySampler = TStaticSamplerState<SF_Bilinear>::GetRHI();
+	Parameters->SceneVelocityTexture = bUseVelocity ? Inputs.SceneVelocity.Texture : Inputs.SceneColor.Texture;
+	Parameters->SceneVelocitySampler = TStaticSamplerState<SF_Point>::GetRHI();
 	Parameters->OutputTexture = GraphBuilder.CreateUAV(OutputTexture);
 	Parameters->CurrentViewRect = FVector4f(
 		Inputs.SceneColor.ViewRect.Min.X,
@@ -158,11 +175,15 @@ UE::Renderer::Private::ITemporalUpscaler::FOutputs FSimpleTemporalUpscaler::AddP
 	Parameters->CurrentTextureExtentInverse = FVector2f(
 		1.0f / Inputs.SceneColor.Texture->Desc.Extent.X,
 		1.0f / Inputs.SceneColor.Texture->Desc.Extent.Y);
+	Parameters->SceneVelocityTextureExtentInverse = bUseVelocity
+		? FVector2f(1.0f / Inputs.SceneVelocity.Texture->Desc.Extent.X, 1.0f / Inputs.SceneVelocity.Texture->Desc.Extent.Y)
+		: FVector2f(1.0f / Inputs.SceneColor.Texture->Desc.Extent.X, 1.0f / Inputs.SceneColor.Texture->Desc.Extent.Y);
 	Parameters->HistoryTextureExtentInverse = bHasHistory
 		? FVector2f(1.0f / PrevHistoryExtent.X, 1.0f / PrevHistoryExtent.Y)
 		: FVector2f(1.0f / Inputs.SceneColor.Texture->Desc.Extent.X, 1.0f / Inputs.SceneColor.Texture->Desc.Extent.Y);
 	Parameters->HistoryWeight = HistoryWeight;
 	Parameters->bHasHistory = bHasHistory ? 1u : 0u;
+	Parameters->bUseVelocity = bUseVelocity ? 1u : 0u;
 
 	TShaderMapRef<FSimpleTemporalUpscalerBlendCS> ComputeShader(GetGlobalShaderMap(View.GetFeatureLevel()));
 	FComputeShaderUtils::AddPass(
