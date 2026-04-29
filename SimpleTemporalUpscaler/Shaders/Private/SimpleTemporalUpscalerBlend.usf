@@ -30,6 +30,7 @@ uint bHasHistory;
 uint bUseVelocity;
 uint CurrentFrameDejitterMode;
 uint bMotionAdaptiveHistory;
+uint bDilateVelocity;
 float MotionHistoryMinSpeed;
 float MotionHistoryMaxSpeed;
 
@@ -43,6 +44,59 @@ float3 SampleCurrentSceneColorPoint(float2 PixelPos)
 	float2 ClampedPixelPos = ClampPixelPosToViewRect(PixelPos, CurrentViewRect);
 	float2 SampleUV = ClampedPixelPos * CurrentTextureExtentInverse;
 	return CurrentSceneColorTexture.SampleLevel(CurrentSceneColorPointSampler, SampleUV, 0).rgb;
+}
+
+float SampleSceneDepthPoint(float2 PixelPos)
+{
+	float2 ClampedPixelPos = ClampPixelPosToViewRect(PixelPos, CurrentViewRect);
+	float2 SampleUV = ClampedPixelPos * SceneDepthTextureExtentInverse;
+	return SceneDepthTexture.SampleLevel(SceneDepthSampler, SampleUV, 0).r;
+}
+
+float4 SampleSceneVelocityPoint(float2 PixelPos)
+{
+	float2 ClampedPixelPos = ClampPixelPosToViewRect(PixelPos, CurrentViewRect);
+	float2 SampleUV = ClampedPixelPos * SceneVelocityTextureExtentInverse;
+	return SceneVelocityTexture.SampleLevel(SceneVelocitySampler, SampleUV, 0);
+}
+
+float4 DilateSceneVelocity3x3(float2 CurrentPixelPos, float CurrentDeviceZ, float4 CenterEncodedVelocity)
+{
+	if (bDilateVelocity == 0 || CenterEncodedVelocity.x > 0.0)
+	{
+		return CenterEncodedVelocity;
+	}
+
+	float4 BestEncodedVelocity = 0.0;
+	float BestDeviceZ = CurrentDeviceZ;
+	bool bFoundVelocity = false;
+
+	UNROLL
+	for (int Y = -1; Y <= 1; ++Y)
+	{
+		UNROLL
+		for (int X = -1; X <= 1; ++X)
+		{
+			float2 SamplePixelPos = CurrentPixelPos + float2(X, Y);
+			float4 SampleEncodedVelocity = SampleSceneVelocityPoint(SamplePixelPos);
+
+			if (SampleEncodedVelocity.x <= 0.0)
+			{
+				continue;
+			}
+
+			float SampleDeviceZ = SampleSceneDepthPoint(SamplePixelPos);
+
+			if (!bFoundVelocity || SampleDeviceZ > BestDeviceZ)
+			{
+				BestDeviceZ = SampleDeviceZ;
+				BestEncodedVelocity = SampleEncodedVelocity;
+				bFoundVelocity = true;
+			}
+		}
+	}
+
+	return bFoundVelocity ? BestEncodedVelocity : CenterEncodedVelocity;
 }
 
 float2 GetCurrentFrameDejitteredPixelPos(float2 CurrentPixelPos)
@@ -170,8 +224,7 @@ void MainCS(uint3 DispatchThreadId : SV_DispatchThreadID)
 		if (bUseVelocity != 0)
 		{
 			float2 CurrentScreenPos = OutputUVToScreenPos(OutputUV);
-			float2 VelocityUV = CurrentPixelPos * SceneVelocityTextureExtentInverse;
-			float4 EncodedVelocity = SceneVelocityTexture.SampleLevel(SceneVelocitySampler, VelocityUV, 0);
+			float4 EncodedVelocity = DilateSceneVelocity3x3(CurrentPixelPos, CurrentDeviceZ, SampleSceneVelocityPoint(CurrentPixelPos));
 
 			if (EncodedVelocity.x > 0.0)
 			{
