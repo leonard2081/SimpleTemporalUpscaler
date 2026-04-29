@@ -2,6 +2,7 @@
 
 Texture2D CurrentSceneColorTexture;
 SamplerState CurrentSceneColorSampler;
+SamplerState CurrentSceneColorPointSampler;
 
 Texture2D PrevHistoryTexture;
 SamplerState PrevHistorySampler;
@@ -27,6 +28,38 @@ float2 HistoryTextureExtentInverse;
 float HistoryWeight;
 uint bHasHistory;
 uint bUseVelocity;
+uint CurrentFrameDejitterMode;
+
+float2 ClampPixelPosToViewRect(float2 PixelPos, float4 ViewRect)
+{
+	return clamp(PixelPos, ViewRect.xy + 0.5, ViewRect.xy + ViewRect.zw - 0.5);
+}
+
+float3 SampleCurrentSceneColorPoint(float2 PixelPos)
+{
+	float2 ClampedPixelPos = ClampPixelPosToViewRect(PixelPos, CurrentViewRect);
+	float2 SampleUV = ClampedPixelPos * CurrentTextureExtentInverse;
+	return CurrentSceneColorTexture.SampleLevel(CurrentSceneColorPointSampler, SampleUV, 0).rgb;
+}
+
+float2 GetCurrentFrameDejitteredPixelPos(float2 CurrentPixelPos)
+{
+	return CurrentPixelPos + View.TemporalAAParams.zw;
+}
+
+float3 SampleCurrentSceneColorDejittered(float2 CurrentPixelPos)
+{
+	float2 SamplePixelPos = CurrentPixelPos;
+
+	if (CurrentFrameDejitterMode != 0)
+	{
+		SamplePixelPos = GetCurrentFrameDejitteredPixelPos(CurrentPixelPos);
+	}
+
+	float2 ClampedPixelPos = ClampPixelPosToViewRect(SamplePixelPos, CurrentViewRect);
+	float2 SampleUV = ClampedPixelPos * CurrentTextureExtentInverse;
+	return CurrentSceneColorTexture.SampleLevel(CurrentSceneColorSampler, SampleUV, 0).rgb;
+}
 
 float2 OutputUVToScreenPos(float2 OutputUV)
 {
@@ -38,9 +71,41 @@ float2 ScreenPosToOutputUV(float2 ScreenPos)
 	return float2(ScreenPos.x * 0.5 + 0.5, 0.5 - ScreenPos.y * 0.5);
 }
 
-float2 ClampPixelPosToViewRect(float2 PixelPos, float4 ViewRect)
+float2 ViewPixelPosToScreenPos(float2 PixelPos, float4 ViewRect)
 {
-	return clamp(PixelPos, ViewRect.xy + 0.5, ViewRect.xy + ViewRect.zw - 0.5);
+	float2 ViewUV = (PixelPos - ViewRect.xy) / ViewRect.zw;
+	return float2(ViewUV.x * 2.0 - 1.0, 1.0 - ViewUV.y * 2.0);
+}
+
+bool ComputeCameraPrevOutputUV(float2 CurrentPixelPos, float CurrentDeviceZ, float2 OutputUV, out float2 OutPrevOutputUV)
+{
+	OutPrevOutputUV = OutputUV;
+
+	float2 CurrentScreenPos = ViewPixelPosToScreenPos(CurrentPixelPos, CurrentViewRect);
+	float4 ThisClip = float4(CurrentScreenPos, CurrentDeviceZ, 1.0);
+	float4 PrevClip = mul(ThisClip, View.ClipToPrevClip);
+
+	if (abs(PrevClip.w) <= 1.0e-6)
+	{
+		return false;
+	}
+
+	float2 PrevScreenPos = PrevClip.xy / PrevClip.w;
+	float2 PrevOutputUV = ScreenPosToOutputUV(PrevScreenPos);
+
+	if (any(PrevOutputUV < 0.0) || any(PrevOutputUV > 1.0))
+	{
+		return false;
+	}
+
+	float2 CameraDeltaUV = PrevOutputUV - OutputUV;
+	if (any(abs(CameraDeltaUV) > 0.05))
+	{
+		return false;
+	}
+
+	OutPrevOutputUV = PrevOutputUV;
+	return true;
 }
 
 void ComputeCurrentColorNeighborhoodMinMax(float2 CurrentPixelPos, out float3 OutMinColor, out float3 OutMaxColor)
@@ -53,8 +118,7 @@ void ComputeCurrentColorNeighborhoodMinMax(float2 CurrentPixelPos, out float3 Ou
 		for (int X = -1; X <= 1; ++X)
 		{
 			float2 SamplePixelPos = ClampPixelPosToViewRect(CurrentPixelPos + float2(X, Y), CurrentViewRect);
-			float2 SampleUV = SamplePixelPos * CurrentTextureExtentInverse;
-			float3 SampleColor = CurrentSceneColorTexture.SampleLevel(CurrentSceneColorSampler, SampleUV, 0).rgb;
+			float3 SampleColor = SampleCurrentSceneColorPoint(SamplePixelPos);
 			OutMinColor = min(OutMinColor, SampleColor);
 			OutMaxColor = max(OutMaxColor, SampleColor);
 		}
@@ -76,11 +140,10 @@ void MainCS(uint3 DispatchThreadId : SV_DispatchThreadID)
 	float2 OutputUV = OutputPixelCenter / float2(OutputSize);
 
 	float2 CurrentPixelPos = ClampPixelPosToViewRect(CurrentViewRect.xy + OutputUV * CurrentViewRect.zw, CurrentViewRect);
-	float2 CurrentUV = CurrentPixelPos * CurrentTextureExtentInverse;
 	float2 CurrentDepthUV = CurrentPixelPos * SceneDepthTextureExtentInverse;
 	float CurrentDeviceZ = SceneDepthTexture.SampleLevel(SceneDepthSampler, CurrentDepthUV, 0).r;
 
-	float3 CurrentColor = CurrentSceneColorTexture.SampleLevel(CurrentSceneColorSampler, CurrentUV, 0).rgb;
+	float3 CurrentColor = SampleCurrentSceneColorDejittered(CurrentPixelPos);
 	float3 OutputColor = CurrentColor;
 
 	if (bHasHistory != 0 && HistoryWeight > 0.0)
@@ -99,6 +162,14 @@ void MainCS(uint3 DispatchThreadId : SV_DispatchThreadID)
 				float2 PrevScreenPos = CurrentScreenPos - ScreenVelocity;
 				PrevOutputUV = ScreenPosToOutputUV(PrevScreenPos);
 			}
+			else
+			{
+				float2 CameraPrevOutputUV;
+				if (ComputeCameraPrevOutputUV(CurrentPixelPos, CurrentDeviceZ, OutputUV, CameraPrevOutputUV))
+				{
+					PrevOutputUV = CameraPrevOutputUV;
+				}
+			}
 		}
 
 		bool bHistoryUVValid = all(PrevOutputUV >= 0.0) && all(PrevOutputUV <= 1.0);
@@ -116,6 +187,9 @@ void MainCS(uint3 DispatchThreadId : SV_DispatchThreadID)
 			float3 CurrentMinColor;
 			float3 CurrentMaxColor;
 			ComputeCurrentColorNeighborhoodMinMax(CurrentPixelPos, CurrentMinColor, CurrentMaxColor);
+			float3 ClampMargin = max((CurrentMaxColor - CurrentMinColor) * 0.25, 1.0 / 255.0);
+			CurrentMinColor -= ClampMargin;
+			CurrentMaxColor += ClampMargin;
 			PrevColor = clamp(PrevColor, CurrentMinColor, CurrentMaxColor);
 			OutputColor = lerp(CurrentColor, PrevColor, HistoryWeight * DepthConfidence);
 		}
