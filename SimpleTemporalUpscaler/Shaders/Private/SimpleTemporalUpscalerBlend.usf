@@ -29,6 +29,9 @@ float HistoryWeight;
 uint bHasHistory;
 uint bUseVelocity;
 uint CurrentFrameDejitterMode;
+uint bMotionAdaptiveHistory;
+float MotionHistoryMinSpeed;
+float MotionHistoryMaxSpeed;
 
 float2 ClampPixelPosToViewRect(float2 PixelPos, float4 ViewRect)
 {
@@ -75,6 +78,18 @@ float2 ViewPixelPosToScreenPos(float2 PixelPos, float4 ViewRect)
 {
 	float2 ViewUV = (PixelPos - ViewRect.xy) / ViewRect.zw;
 	return float2(ViewUV.x * 2.0 - 1.0, 1.0 - ViewUV.y * 2.0);
+}
+
+float ComputeMotionConfidence(float2 PrevOutputUV, float2 OutputUV)
+{
+	if (bMotionAdaptiveHistory == 0)
+	{
+		return 1.0;
+	}
+
+	float2 VelocityPixels = (PrevOutputUV - OutputUV) * OutputViewRect.zw;
+	float PixelSpeed = length(VelocityPixels);
+	return 1.0 - saturate((PixelSpeed - MotionHistoryMinSpeed) / max(MotionHistoryMaxSpeed - MotionHistoryMinSpeed, 1.0e-3));
 }
 
 bool ComputeCameraPrevOutputUV(float2 CurrentPixelPos, float CurrentDeviceZ, float2 OutputUV, out float2 OutPrevOutputUV)
@@ -149,6 +164,7 @@ void MainCS(uint3 DispatchThreadId : SV_DispatchThreadID)
 	if (bHasHistory != 0 && HistoryWeight > 0.0)
 	{
 		float2 PrevOutputUV = OutputUV;
+		bool bHistoryReprojected = bUseVelocity == 0;
 
 		if (bUseVelocity != 0)
 		{
@@ -161,6 +177,7 @@ void MainCS(uint3 DispatchThreadId : SV_DispatchThreadID)
 				float2 ScreenVelocity = DecodeVelocityFromTexture(EncodedVelocity).xy;
 				float2 PrevScreenPos = CurrentScreenPos - ScreenVelocity;
 				PrevOutputUV = ScreenPosToOutputUV(PrevScreenPos);
+				bHistoryReprojected = true;
 			}
 			else
 			{
@@ -168,11 +185,12 @@ void MainCS(uint3 DispatchThreadId : SV_DispatchThreadID)
 				if (ComputeCameraPrevOutputUV(CurrentPixelPos, CurrentDeviceZ, OutputUV, CameraPrevOutputUV))
 				{
 					PrevOutputUV = CameraPrevOutputUV;
+					bHistoryReprojected = true;
 				}
 			}
 		}
 
-		bool bHistoryUVValid = all(PrevOutputUV >= 0.0) && all(PrevOutputUV <= 1.0);
+		bool bHistoryUVValid = bHistoryReprojected && all(PrevOutputUV >= 0.0) && all(PrevOutputUV <= 1.0);
 
 		if (bHistoryUVValid)
 		{
@@ -191,7 +209,8 @@ void MainCS(uint3 DispatchThreadId : SV_DispatchThreadID)
 			CurrentMinColor -= ClampMargin;
 			CurrentMaxColor += ClampMargin;
 			PrevColor = clamp(PrevColor, CurrentMinColor, CurrentMaxColor);
-			OutputColor = lerp(CurrentColor, PrevColor, HistoryWeight * DepthConfidence);
+			float EffectiveHistoryWeight = HistoryWeight * DepthConfidence * ComputeMotionConfidence(PrevOutputUV, OutputUV);
+			OutputColor = lerp(CurrentColor, PrevColor, EffectiveHistoryWeight);
 		}
 	}
 

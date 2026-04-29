@@ -37,6 +37,9 @@ public:
 		SHADER_PARAMETER(uint32, bHasHistory)
 		SHADER_PARAMETER(uint32, bUseVelocity)
 		SHADER_PARAMETER(uint32, CurrentFrameDejitterMode)
+		SHADER_PARAMETER(uint32, bMotionAdaptiveHistory)
+		SHADER_PARAMETER(float, MotionHistoryMinSpeed)
+		SHADER_PARAMETER(float, MotionHistoryMaxSpeed)
 	END_SHADER_PARAMETER_STRUCT()
 };
 
@@ -77,6 +80,26 @@ static TAutoConsoleVariable<int32> CVarSimpleTemporalUpscalerCurrentFrameDejitte
 	TEXT("Applies jitter-aware sampling when reading the current low-resolution scene color.\n")
 	TEXT(" 0: disabled, sample the mapped current frame position directly;\n")
 	TEXT(" 1: enabled, sample the current frame at the temporal-jitter-compensated position.\n"),
+	ECVF_RenderThreadSafe);
+
+static TAutoConsoleVariable<int32> CVarSimpleTemporalUpscalerMotionAdaptiveHistory(
+	TEXT("r.SimpleTemporalUpscaler.MotionAdaptiveHistory"),
+	1,
+	TEXT("Reduces history weight on pixels with large motion to limit ghosting while keeping static areas stable.\n")
+	TEXT(" 0: disabled;\n")
+	TEXT(" 1: enabled.\n"),
+	ECVF_RenderThreadSafe);
+
+static TAutoConsoleVariable<float> CVarSimpleTemporalUpscalerMotionHistoryMinSpeed(
+	TEXT("r.SimpleTemporalUpscaler.MotionHistoryMinSpeed"),
+	0.5f,
+	TEXT("Pixel speed where motion-adaptive history starts reducing the history weight.\n"),
+	ECVF_RenderThreadSafe);
+
+static TAutoConsoleVariable<float> CVarSimpleTemporalUpscalerMotionHistoryMaxSpeed(
+	TEXT("r.SimpleTemporalUpscaler.MotionHistoryMaxSpeed"),
+	8.0f,
+	TEXT("Pixel speed where motion-adaptive history reaches zero history contribution.\n"),
 	ECVF_RenderThreadSafe);
 
 static TAutoConsoleVariable<int32> CVarSimpleTemporalUpscalerLogStats(
@@ -165,12 +188,15 @@ UE::Renderer::Private::ITemporalUpscaler::FOutputs FSimpleTemporalUpscaler::AddP
 	const float HistoryWeight = FMath::Clamp(CVarSimpleTemporalUpscalerHistoryWeight.GetValueOnRenderThread(), 0.0f, 1.0f);
 	const bool bUseVelocity = CVarSimpleTemporalUpscalerUseVelocity.GetValueOnRenderThread() != 0 && Inputs.SceneVelocity.Texture != nullptr;
 	const uint32 CurrentFrameDejitterMode = CVarSimpleTemporalUpscalerCurrentFrameDejitter.GetValueOnRenderThread() != 0 ? 1u : 0u;
+	const uint32 bMotionAdaptiveHistory = CVarSimpleTemporalUpscalerMotionAdaptiveHistory.GetValueOnRenderThread() != 0 ? 1u : 0u;
+	const float MotionHistoryMinSpeed = FMath::Max(CVarSimpleTemporalUpscalerMotionHistoryMinSpeed.GetValueOnRenderThread(), 0.0f);
+	const float MotionHistoryMaxSpeed = FMath::Max(CVarSimpleTemporalUpscalerMotionHistoryMaxSpeed.GetValueOnRenderThread(), MotionHistoryMinSpeed + 0.001f);
 
 	if (CVarSimpleTemporalUpscalerLogStats.GetValueOnRenderThread() != 0)
 	{
 		const float InputFractionX = float(Inputs.SceneColor.ViewRect.Width()) / float(OutputExtent.X);
 		const float InputFractionY = float(Inputs.SceneColor.ViewRect.Height()) / float(OutputExtent.Y);
-		UE_LOG(LogTemp, Warning, TEXT("SimpleTemporalUpscaler Input=%dx%d Output=%dx%d Fraction=(%.3f, %.3f) Supported=(%.3f, %.3f) HasHistory=%d HistoryWeight=%.3f UseVelocity=%d CurrentFrameDejitter=%u"),
+		UE_LOG(LogTemp, Warning, TEXT("SimpleTemporalUpscaler Input=%dx%d Output=%dx%d Fraction=(%.3f, %.3f) Supported=(%.3f, %.3f) HasHistory=%d HistoryWeight=%.3f UseVelocity=%d CurrentFrameDejitter=%u MotionAdaptiveHistory=%u MotionSpeedRange=(%.2f, %.2f)"),
 			Inputs.SceneColor.ViewRect.Width(),
 			Inputs.SceneColor.ViewRect.Height(),
 			OutputExtent.X,
@@ -182,7 +208,10 @@ UE::Renderer::Private::ITemporalUpscaler::FOutputs FSimpleTemporalUpscaler::AddP
 			bHasHistory ? 1 : 0,
 			HistoryWeight,
 			bUseVelocity ? 1 : 0,
-			CurrentFrameDejitterMode);
+			CurrentFrameDejitterMode,
+			bMotionAdaptiveHistory,
+			MotionHistoryMinSpeed,
+			MotionHistoryMaxSpeed);
 	}
 
 	FSimpleTemporalUpscalerBlendCS::FParameters* Parameters = GraphBuilder.AllocParameters<FSimpleTemporalUpscalerBlendCS::FParameters>();
@@ -226,6 +255,9 @@ UE::Renderer::Private::ITemporalUpscaler::FOutputs FSimpleTemporalUpscaler::AddP
 	Parameters->bHasHistory = bHasHistory ? 1u : 0u;
 	Parameters->bUseVelocity = bUseVelocity ? 1u : 0u;
 	Parameters->CurrentFrameDejitterMode = CurrentFrameDejitterMode;
+	Parameters->bMotionAdaptiveHistory = bMotionAdaptiveHistory;
+	Parameters->MotionHistoryMinSpeed = MotionHistoryMinSpeed;
+	Parameters->MotionHistoryMaxSpeed = MotionHistoryMaxSpeed;
 
 	TShaderMapRef<FSimpleTemporalUpscalerBlendCS> ComputeShader(GetGlobalShaderMap(View.GetFeatureLevel()));
 	FComputeShaderUtils::AddPass(
