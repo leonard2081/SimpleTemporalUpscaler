@@ -17,11 +17,14 @@ public:
 		SHADER_PARAMETER_SAMPLER(SamplerState, CurrentSceneColorSampler)
 		SHADER_PARAMETER_RDG_TEXTURE(Texture2D, PrevHistoryTexture)
 		SHADER_PARAMETER_SAMPLER(SamplerState, PrevHistorySampler)
+		SHADER_PARAMETER_RDG_TEXTURE(Texture2D, PrevDepthHistoryTexture)
+		SHADER_PARAMETER_SAMPLER(SamplerState, PrevDepthHistorySampler)
 		SHADER_PARAMETER_RDG_TEXTURE(Texture2D, SceneVelocityTexture)
 		SHADER_PARAMETER_SAMPLER(SamplerState, SceneVelocitySampler)
 		SHADER_PARAMETER_RDG_TEXTURE(Texture2D, SceneDepthTexture)
 		SHADER_PARAMETER_SAMPLER(SamplerState, SceneDepthSampler)
 		SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2D<float4>, OutputTexture)
+		SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2D<float>, OutputDepthHistoryTexture)
 		SHADER_PARAMETER_STRUCT_REF(FViewUniformShaderParameters, View)
 		SHADER_PARAMETER(FVector4f, CurrentViewRect)
 		SHADER_PARAMETER(FVector4f, OutputViewRect)
@@ -122,18 +125,29 @@ UE::Renderer::Private::ITemporalUpscaler::FOutputs FSimpleTemporalUpscaler::AddP
 
 	FRDGTextureRef OutputTexture = GraphBuilder.CreateTexture(OutputDesc, TEXT("SimpleTemporalUpscaler.Output"));
 
+	FRDGTextureDesc OutputDepthHistoryDesc = FRDGTextureDesc::Create2D(
+		FIntPoint(Inputs.OutputViewRect.Max.X, Inputs.OutputViewRect.Max.Y),
+		PF_R32_FLOAT,
+		FClearValueBinding::Black,
+		TexCreate_ShaderResource | TexCreate_UAV);
+
+	FRDGTextureRef OutputDepthHistoryTexture = GraphBuilder.CreateTexture(OutputDepthHistoryDesc, TEXT("SimpleTemporalUpscaler.OutputDepthHistory"));
+
 	FHistory* PrevHistory = static_cast<FHistory*>(Inputs.PrevHistory.GetReference());
 	const bool bHasHistory =
 		PrevHistory &&
 		PrevHistory->ColorHistory.IsValid() &&
+		PrevHistory->DepthHistory.IsValid() &&
 		PrevHistory->ViewRect == Inputs.OutputViewRect &&
 		PrevHistory->Extent == FIntPoint(Inputs.OutputViewRect.Max.X, Inputs.OutputViewRect.Max.Y);
 
 	FRDGTextureRef PrevHistoryTexture = nullptr;
+	FRDGTextureRef PrevDepthHistoryTexture = nullptr;
 	FIntPoint PrevHistoryExtent = FIntPoint::ZeroValue;
 	if (bHasHistory)
 	{
 		PrevHistoryTexture = GraphBuilder.RegisterExternalTexture(PrevHistory->ColorHistory, TEXT("SimpleTemporalUpscaler.PrevHistory"));
+		PrevDepthHistoryTexture = GraphBuilder.RegisterExternalTexture(PrevHistory->DepthHistory, TEXT("SimpleTemporalUpscaler.PrevDepthHistory"));
 		PrevHistoryExtent = PrevHistory->Extent;
 	}
 
@@ -163,11 +177,14 @@ UE::Renderer::Private::ITemporalUpscaler::FOutputs FSimpleTemporalUpscaler::AddP
 	Parameters->CurrentSceneColorSampler = TStaticSamplerState<SF_Bilinear>::GetRHI();
 	Parameters->PrevHistoryTexture = bHasHistory ? PrevHistoryTexture : Inputs.SceneColor.Texture;
 	Parameters->PrevHistorySampler = TStaticSamplerState<SF_Bilinear>::GetRHI();
+	Parameters->PrevDepthHistoryTexture = bHasHistory ? PrevDepthHistoryTexture : Inputs.SceneDepth.Texture;
+	Parameters->PrevDepthHistorySampler = TStaticSamplerState<SF_Point>::GetRHI();
 	Parameters->SceneVelocityTexture = bUseVelocity ? Inputs.SceneVelocity.Texture : Inputs.SceneColor.Texture;
 	Parameters->SceneVelocitySampler = TStaticSamplerState<SF_Point>::GetRHI();
 	Parameters->SceneDepthTexture = Inputs.SceneDepth.Texture;
 	Parameters->SceneDepthSampler = TStaticSamplerState<SF_Point>::GetRHI();
 	Parameters->OutputTexture = GraphBuilder.CreateUAV(OutputTexture);
+	Parameters->OutputDepthHistoryTexture = GraphBuilder.CreateUAV(OutputDepthHistoryTexture);
 	Parameters->View = View.ViewUniformBuffer;
 	Parameters->CurrentViewRect = FVector4f(
 		Inputs.SceneColor.ViewRect.Min.X,
@@ -207,6 +224,7 @@ UE::Renderer::Private::ITemporalUpscaler::FOutputs FSimpleTemporalUpscaler::AddP
 	NewHistory->ViewRect = Inputs.OutputViewRect;
 	NewHistory->Extent = FIntPoint(Inputs.OutputViewRect.Max.X, Inputs.OutputViewRect.Max.Y);
 	GraphBuilder.QueueTextureExtraction(OutputTexture, &NewHistory->ColorHistory);
+	GraphBuilder.QueueTextureExtraction(OutputDepthHistoryTexture, &NewHistory->DepthHistory);
 
 	Outputs.FullRes = FScreenPassTexture(OutputTexture, Inputs.OutputViewRect);
 	Outputs.NewHistory = NewHistory;

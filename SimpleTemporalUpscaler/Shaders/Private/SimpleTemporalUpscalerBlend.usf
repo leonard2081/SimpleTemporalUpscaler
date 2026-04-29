@@ -6,6 +6,9 @@ SamplerState CurrentSceneColorSampler;
 Texture2D PrevHistoryTexture;
 SamplerState PrevHistorySampler;
 
+Texture2D PrevDepthHistoryTexture;
+SamplerState PrevDepthHistorySampler;
+
 Texture2D SceneVelocityTexture;
 SamplerState SceneVelocitySampler;
 
@@ -13,6 +16,7 @@ Texture2D SceneDepthTexture;
 SamplerState SceneDepthSampler;
 
 RWTexture2D<float4> OutputTexture;
+RWTexture2D<float> OutputDepthHistoryTexture;
 
 float4 CurrentViewRect;
 float4 OutputViewRect;
@@ -73,6 +77,8 @@ void MainCS(uint3 DispatchThreadId : SV_DispatchThreadID)
 
 	float2 CurrentPixelPos = ClampPixelPosToViewRect(CurrentViewRect.xy + OutputUV * CurrentViewRect.zw, CurrentViewRect);
 	float2 CurrentUV = CurrentPixelPos * CurrentTextureExtentInverse;
+	float2 CurrentDepthUV = CurrentPixelPos * SceneDepthTextureExtentInverse;
+	float CurrentDeviceZ = SceneDepthTexture.SampleLevel(SceneDepthSampler, CurrentDepthUV, 0).r;
 
 	float3 CurrentColor = CurrentSceneColorTexture.SampleLevel(CurrentSceneColorSampler, CurrentUV, 0).rgb;
 	float3 OutputColor = CurrentColor;
@@ -102,14 +108,20 @@ void MainCS(uint3 DispatchThreadId : SV_DispatchThreadID)
 			float2 HistoryPixelPos = ClampPixelPosToViewRect(OutputViewRect.xy + PrevOutputUV * OutputViewRect.zw, OutputViewRect);
 			float2 HistoryUV = HistoryPixelPos * HistoryTextureExtentInverse;
 			float3 PrevColor = PrevHistoryTexture.SampleLevel(PrevHistorySampler, HistoryUV, 0).rgb;
+			float PrevDeviceZ = PrevDepthHistoryTexture.SampleLevel(PrevDepthHistorySampler, HistoryUV, 0).r;
+			float CurrentLinearDepth = ConvertFromDeviceZ(CurrentDeviceZ);
+			float PrevLinearDepth = ConvertFromDeviceZ(PrevDeviceZ);
+			float DepthDiff = abs(CurrentLinearDepth - PrevLinearDepth);
+			float DepthConfidence = 1.0 - saturate((DepthDiff - 5.0) / 50.0);
 			float3 CurrentMinColor;
 			float3 CurrentMaxColor;
 			ComputeCurrentColorNeighborhoodMinMax(CurrentPixelPos, CurrentMinColor, CurrentMaxColor);
 			PrevColor = clamp(PrevColor, CurrentMinColor, CurrentMaxColor);
-			OutputColor = lerp(CurrentColor, PrevColor, HistoryWeight);
+			OutputColor = lerp(CurrentColor, PrevColor, HistoryWeight * DepthConfidence);
 		}
 	}
 
 	uint2 OutputPixelPos = uint2(OutputViewRect.xy) + LocalOutputPixelPos;
 	OutputTexture[OutputPixelPos] = float4(OutputColor, 1.0);
+	OutputDepthHistoryTexture[OutputPixelPos] = CurrentDeviceZ;
 }
