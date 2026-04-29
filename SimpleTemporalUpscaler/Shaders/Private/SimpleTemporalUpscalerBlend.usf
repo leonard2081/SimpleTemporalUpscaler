@@ -165,6 +165,7 @@ void MainCS(uint3 DispatchThreadId : SV_DispatchThreadID)
 	{
 		float2 PrevOutputUV = OutputUV;
 		bool bHistoryReprojected = bUseVelocity == 0;
+		float MotionConfidence = 1.0;
 
 		if (bUseVelocity != 0)
 		{
@@ -178,6 +179,7 @@ void MainCS(uint3 DispatchThreadId : SV_DispatchThreadID)
 				float2 PrevScreenPos = CurrentScreenPos - ScreenVelocity;
 				PrevOutputUV = ScreenPosToOutputUV(PrevScreenPos);
 				bHistoryReprojected = true;
+				MotionConfidence = ComputeMotionConfidence(PrevOutputUV, OutputUV);
 			}
 			else
 			{
@@ -209,7 +211,7 @@ void MainCS(uint3 DispatchThreadId : SV_DispatchThreadID)
 			CurrentMinColor -= ClampMargin;
 			CurrentMaxColor += ClampMargin;
 			PrevColor = clamp(PrevColor, CurrentMinColor, CurrentMaxColor);
-			float EffectiveHistoryWeight = HistoryWeight * DepthConfidence * ComputeMotionConfidence(PrevOutputUV, OutputUV);
+			float EffectiveHistoryWeight = HistoryWeight * DepthConfidence * MotionConfidence;
 			OutputColor = lerp(CurrentColor, PrevColor, EffectiveHistoryWeight);
 		}
 	}
