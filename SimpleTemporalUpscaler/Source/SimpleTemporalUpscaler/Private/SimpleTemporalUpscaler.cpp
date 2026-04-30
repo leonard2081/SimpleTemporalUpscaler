@@ -121,7 +121,8 @@ static TAutoConsoleVariable<int32> CVarSimpleTemporalUpscalerDebugMode(
 	TEXT(" 2: depth confidence;\n")
 	TEXT(" 3: motion confidence;\n")
 	TEXT(" 4: history path classification;\n")
-	TEXT(" 5: dilated velocity usage mask.\n"),
+	TEXT(" 5: dilated velocity usage mask;\n")
+	TEXT(" 6: pixel speed normalized by MotionHistoryMaxSpeed.\n"),
 	ECVF_RenderThreadSafe);
 
 static TAutoConsoleVariable<int32> CVarSimpleTemporalUpscalerLogStats(

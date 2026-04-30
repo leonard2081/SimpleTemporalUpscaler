@@ -135,6 +135,12 @@ float2 ViewPixelPosToScreenPos(float2 PixelPos, float4 ViewRect)
 	return float2(ViewUV.x * 2.0 - 1.0, 1.0 - ViewUV.y * 2.0);
 }
 
+float ComputePixelSpeed(float2 PrevOutputUV, float2 OutputUV)
+{
+	float2 VelocityPixels = (PrevOutputUV - OutputUV) * OutputViewRect.zw;
+	return length(VelocityPixels);
+}
+
 float ComputeMotionConfidence(float2 PrevOutputUV, float2 OutputUV)
 {
 	if (bMotionAdaptiveHistory == 0)
@@ -142,8 +148,7 @@ float ComputeMotionConfidence(float2 PrevOutputUV, float2 OutputUV)
 		return 1.0;
 	}
 
-	float2 VelocityPixels = (PrevOutputUV - OutputUV) * OutputViewRect.zw;
-	float PixelSpeed = length(VelocityPixels);
+	float PixelSpeed = ComputePixelSpeed(PrevOutputUV, OutputUV);
 	return 1.0 - saturate((PixelSpeed - MotionHistoryMinSpeed) / max(MotionHistoryMaxSpeed - MotionHistoryMinSpeed, 1.0e-3));
 }
 
@@ -218,6 +223,7 @@ void MainCS(uint3 DispatchThreadId : SV_DispatchThreadID)
 	float DebugEffectiveHistoryWeight = 0.0;
 	float DebugDepthConfidence = 0.0;
 	float DebugMotionConfidence = 1.0;
+	float DebugPixelSpeed = 0.0;
 	float3 DebugHistoryPathColor = float3(0.25, 0.0, 0.0);
 	float DebugDilatedVelocity = 0.0;
 
@@ -246,6 +252,7 @@ void MainCS(uint3 DispatchThreadId : SV_DispatchThreadID)
 				PrevOutputUV = ScreenPosToOutputUV(PrevScreenPos);
 				bHistoryReprojected = true;
 				MotionConfidence = ComputeMotionConfidence(PrevOutputUV, OutputUV);
+				DebugPixelSpeed = ComputePixelSpeed(PrevOutputUV, OutputUV);
 				DebugMotionConfidence = MotionConfidence;
 				DebugHistoryPathColor = DebugDilatedVelocity > 0.0 ? float3(1.0, 0.0, 1.0) : float3(0.0, 1.0, 0.0);
 			}
@@ -311,6 +318,10 @@ void MainCS(uint3 DispatchThreadId : SV_DispatchThreadID)
 	else if (DebugMode == 5)
 	{
 		OutputColor = DebugDilatedVelocity.xxx;
+	}
+	else if (DebugMode == 6)
+	{
+		OutputColor = saturate(DebugPixelSpeed / max(MotionHistoryMaxSpeed, 1.0e-3)).xxx;
 	}
 
 	uint2 OutputPixelPos = uint2(OutputViewRect.xy) + LocalOutputPixelPos;
