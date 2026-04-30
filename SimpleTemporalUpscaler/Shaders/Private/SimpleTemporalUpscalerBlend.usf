@@ -31,6 +31,7 @@ uint bUseVelocity;
 uint CurrentFrameDejitterMode;
 uint bMotionAdaptiveHistory;
 uint bDilateVelocity;
+uint DebugMode;
 float MotionHistoryMinSpeed;
 float MotionHistoryMaxSpeed;
 
@@ -214,6 +215,11 @@ void MainCS(uint3 DispatchThreadId : SV_DispatchThreadID)
 
 	float3 CurrentColor = SampleCurrentSceneColorDejittered(CurrentPixelPos);
 	float3 OutputColor = CurrentColor;
+	float DebugEffectiveHistoryWeight = 0.0;
+	float DebugDepthConfidence = 0.0;
+	float DebugMotionConfidence = 1.0;
+	float3 DebugHistoryPathColor = float3(0.25, 0.0, 0.0);
+	float DebugDilatedVelocity = 0.0;
 
 	if (bHasHistory != 0 && HistoryWeight > 0.0)
 	{
@@ -221,10 +227,17 @@ void MainCS(uint3 DispatchThreadId : SV_DispatchThreadID)
 		bool bHistoryReprojected = bUseVelocity == 0;
 		float MotionConfidence = 1.0;
 
+		if (bUseVelocity == 0)
+		{
+			DebugHistoryPathColor = float3(1.0, 1.0, 0.0);
+		}
+
 		if (bUseVelocity != 0)
 		{
 			float2 CurrentScreenPos = OutputUVToScreenPos(OutputUV);
-			float4 EncodedVelocity = DilateSceneVelocity3x3(CurrentPixelPos, CurrentDeviceZ, SampleSceneVelocityPoint(CurrentPixelPos));
+			float4 CenterEncodedVelocity = SampleSceneVelocityPoint(CurrentPixelPos);
+			float4 EncodedVelocity = DilateSceneVelocity3x3(CurrentPixelPos, CurrentDeviceZ, CenterEncodedVelocity);
+			DebugDilatedVelocity = CenterEncodedVelocity.x <= 0.0 && EncodedVelocity.x > 0.0 ? 1.0 : 0.0;
 
 			if (EncodedVelocity.x > 0.0)
 			{
@@ -233,6 +246,8 @@ void MainCS(uint3 DispatchThreadId : SV_DispatchThreadID)
 				PrevOutputUV = ScreenPosToOutputUV(PrevScreenPos);
 				bHistoryReprojected = true;
 				MotionConfidence = ComputeMotionConfidence(PrevOutputUV, OutputUV);
+				DebugMotionConfidence = MotionConfidence;
+				DebugHistoryPathColor = DebugDilatedVelocity > 0.0 ? float3(1.0, 0.0, 1.0) : float3(0.0, 1.0, 0.0);
 			}
 			else
 			{
@@ -241,11 +256,17 @@ void MainCS(uint3 DispatchThreadId : SV_DispatchThreadID)
 				{
 					PrevOutputUV = CameraPrevOutputUV;
 					bHistoryReprojected = true;
+					DebugHistoryPathColor = float3(0.0, 0.4, 1.0);
 				}
 			}
 		}
 
 		bool bHistoryUVValid = bHistoryReprojected && all(PrevOutputUV >= 0.0) && all(PrevOutputUV <= 1.0);
+
+		if (!bHistoryUVValid)
+		{
+			DebugHistoryPathColor = float3(1.0, 0.0, 0.0);
+		}
 
 		if (bHistoryUVValid)
 		{
@@ -257,6 +278,7 @@ void MainCS(uint3 DispatchThreadId : SV_DispatchThreadID)
 			float PrevLinearDepth = ConvertFromDeviceZ(PrevDeviceZ);
 			float DepthDiff = abs(CurrentLinearDepth - PrevLinearDepth);
 			float DepthConfidence = 1.0 - saturate((DepthDiff - 5.0) / 50.0);
+			DebugDepthConfidence = DepthConfidence;
 			float3 CurrentMinColor;
 			float3 CurrentMaxColor;
 			ComputeCurrentColorNeighborhoodMinMax(CurrentPixelPos, CurrentMinColor, CurrentMaxColor);
@@ -265,8 +287,30 @@ void MainCS(uint3 DispatchThreadId : SV_DispatchThreadID)
 			CurrentMaxColor += ClampMargin;
 			PrevColor = clamp(PrevColor, CurrentMinColor, CurrentMaxColor);
 			float EffectiveHistoryWeight = HistoryWeight * DepthConfidence * MotionConfidence;
+			DebugEffectiveHistoryWeight = EffectiveHistoryWeight;
 			OutputColor = lerp(CurrentColor, PrevColor, EffectiveHistoryWeight);
 		}
+	}
+
+	if (DebugMode == 1)
+	{
+		OutputColor = DebugEffectiveHistoryWeight.xxx;
+	}
+	else if (DebugMode == 2)
+	{
+		OutputColor = DebugDepthConfidence.xxx;
+	}
+	else if (DebugMode == 3)
+	{
+		OutputColor = DebugMotionConfidence.xxx;
+	}
+	else if (DebugMode == 4)
+	{
+		OutputColor = DebugHistoryPathColor;
+	}
+	else if (DebugMode == 5)
+	{
+		OutputColor = DebugDilatedVelocity.xxx;
 	}
 
 	uint2 OutputPixelPos = uint2(OutputViewRect.xy) + LocalOutputPixelPos;

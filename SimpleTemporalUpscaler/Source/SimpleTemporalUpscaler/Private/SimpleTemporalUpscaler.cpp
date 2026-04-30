@@ -39,6 +39,7 @@ public:
 		SHADER_PARAMETER(uint32, CurrentFrameDejitterMode)
 		SHADER_PARAMETER(uint32, bMotionAdaptiveHistory)
 		SHADER_PARAMETER(uint32, bDilateVelocity)
+		SHADER_PARAMETER(uint32, DebugMode)
 		SHADER_PARAMETER(float, MotionHistoryMinSpeed)
 		SHADER_PARAMETER(float, MotionHistoryMaxSpeed)
 	END_SHADER_PARAMETER_STRUCT()
@@ -109,6 +110,18 @@ static TAutoConsoleVariable<int32> CVarSimpleTemporalUpscalerDilateVelocity(
 	TEXT("Fills missing scene velocity from the nearest-depth valid velocity in a 3x3 neighborhood before history reprojection.\n")
 	TEXT(" 0: disabled;\n")
 	TEXT(" 1: enabled.\n"),
+	ECVF_RenderThreadSafe);
+
+static TAutoConsoleVariable<int32> CVarSimpleTemporalUpscalerDebugMode(
+	TEXT("r.SimpleTemporalUpscaler.DebugMode"),
+	0,
+	TEXT("Visualizes SimpleTemporalUpscaler intermediate confidence and path data.\n")
+	TEXT(" 0: normal output;\n")
+	TEXT(" 1: effective history weight;\n")
+	TEXT(" 2: depth confidence;\n")
+	TEXT(" 3: motion confidence;\n")
+	TEXT(" 4: history path classification;\n")
+	TEXT(" 5: dilated velocity usage mask.\n"),
 	ECVF_RenderThreadSafe);
 
 static TAutoConsoleVariable<int32> CVarSimpleTemporalUpscalerLogStats(
@@ -199,6 +212,7 @@ UE::Renderer::Private::ITemporalUpscaler::FOutputs FSimpleTemporalUpscaler::AddP
 	const uint32 CurrentFrameDejitterMode = CVarSimpleTemporalUpscalerCurrentFrameDejitter.GetValueOnRenderThread() != 0 ? 1u : 0u;
 	const uint32 bMotionAdaptiveHistory = CVarSimpleTemporalUpscalerMotionAdaptiveHistory.GetValueOnRenderThread() != 0 ? 1u : 0u;
 	const uint32 bDilateVelocity = CVarSimpleTemporalUpscalerDilateVelocity.GetValueOnRenderThread() != 0 ? 1u : 0u;
+	const uint32 DebugMode = FMath::Max(CVarSimpleTemporalUpscalerDebugMode.GetValueOnRenderThread(), 0);
 	const float MotionHistoryMinSpeed = FMath::Max(CVarSimpleTemporalUpscalerMotionHistoryMinSpeed.GetValueOnRenderThread(), 0.0f);
 	const float MotionHistoryMaxSpeed = FMath::Max(CVarSimpleTemporalUpscalerMotionHistoryMaxSpeed.GetValueOnRenderThread(), MotionHistoryMinSpeed + 0.001f);
 
@@ -206,7 +220,7 @@ UE::Renderer::Private::ITemporalUpscaler::FOutputs FSimpleTemporalUpscaler::AddP
 	{
 		const float InputFractionX = float(Inputs.SceneColor.ViewRect.Width()) / float(OutputExtent.X);
 		const float InputFractionY = float(Inputs.SceneColor.ViewRect.Height()) / float(OutputExtent.Y);
-		UE_LOG(LogTemp, Warning, TEXT("SimpleTemporalUpscaler Input=%dx%d Output=%dx%d Fraction=(%.3f, %.3f) Supported=(%.3f, %.3f) HasHistory=%d HistoryWeight=%.3f UseVelocity=%d CurrentFrameDejitter=%u MotionAdaptiveHistory=%u DilateVelocity=%u MotionSpeedRange=(%.2f, %.2f)"),
+		UE_LOG(LogTemp, Warning, TEXT("SimpleTemporalUpscaler Input=%dx%d Output=%dx%d Fraction=(%.3f, %.3f) Supported=(%.3f, %.3f) HasHistory=%d HistoryWeight=%.3f UseVelocity=%d CurrentFrameDejitter=%u MotionAdaptiveHistory=%u DilateVelocity=%u DebugMode=%u MotionSpeedRange=(%.2f, %.2f)"),
 			Inputs.SceneColor.ViewRect.Width(),
 			Inputs.SceneColor.ViewRect.Height(),
 			OutputExtent.X,
@@ -221,6 +235,7 @@ UE::Renderer::Private::ITemporalUpscaler::FOutputs FSimpleTemporalUpscaler::AddP
 			CurrentFrameDejitterMode,
 			bMotionAdaptiveHistory,
 			bDilateVelocity,
+			DebugMode,
 			MotionHistoryMinSpeed,
 			MotionHistoryMaxSpeed);
 	}
@@ -268,6 +283,7 @@ UE::Renderer::Private::ITemporalUpscaler::FOutputs FSimpleTemporalUpscaler::AddP
 	Parameters->CurrentFrameDejitterMode = CurrentFrameDejitterMode;
 	Parameters->bMotionAdaptiveHistory = bMotionAdaptiveHistory;
 	Parameters->bDilateVelocity = bDilateVelocity;
+	Parameters->DebugMode = DebugMode;
 	Parameters->MotionHistoryMinSpeed = MotionHistoryMinSpeed;
 	Parameters->MotionHistoryMaxSpeed = MotionHistoryMaxSpeed;
 
