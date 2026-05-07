@@ -20,12 +20,15 @@ public:
 		SHADER_PARAMETER_SAMPLER(SamplerState, PrevHistorySampler)
 		SHADER_PARAMETER_RDG_TEXTURE(Texture2D, PrevDepthHistoryTexture)
 		SHADER_PARAMETER_SAMPLER(SamplerState, PrevDepthHistorySampler)
+		SHADER_PARAMETER_RDG_TEXTURE(Texture2D, PrevLockState)
+		SHADER_PARAMETER_SAMPLER(SamplerState, PrevLockStateSampler)
 		SHADER_PARAMETER_RDG_TEXTURE(Texture2D, SceneVelocityTexture)
 		SHADER_PARAMETER_SAMPLER(SamplerState, SceneVelocitySampler)
 		SHADER_PARAMETER_RDG_TEXTURE(Texture2D, SceneDepthTexture)
 		SHADER_PARAMETER_SAMPLER(SamplerState, SceneDepthSampler)
 		SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2D<float4>, OutputTexture)
 		SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2D<float>, OutputDepthHistoryTexture)
+		SHADER_PARAMETER_RDG_TEXTURE_UAV(RWTexture2D<float>, OutputLockState)
 		SHADER_PARAMETER_STRUCT_REF(FViewUniformShaderParameters, View)
 		SHADER_PARAMETER(FVector4f, CurrentViewRect)
 		SHADER_PARAMETER(FVector4f, OutputViewRect)
@@ -41,6 +44,7 @@ public:
 		SHADER_PARAMETER(uint32, bDilateVelocity)
 		SHADER_PARAMETER(uint32, DebugMode)
 		SHADER_PARAMETER(uint32, bYCoCgClamp)
+		SHADER_PARAMETER(uint32, bLock)
 		SHADER_PARAMETER(float, MotionHistoryMinSpeed)
 		SHADER_PARAMETER(float, MotionHistoryMaxSpeed)
 	END_SHADER_PARAMETER_STRUCT()
@@ -113,6 +117,14 @@ static TAutoConsoleVariable<int32> CVarSimpleTemporalUpscalerDilateVelocity(
 	TEXT(" 1: enabled.\n"),
 	ECVF_RenderThreadSafe);
 
+static TAutoConsoleVariable<int32> CVarSimpleTemporalUpscalerLock(
+	TEXT("r.SimpleTemporalUpscaler.Lock"),
+	1,
+	TEXT("Protects stable high-frequency features from being over-clamped by colour rectification.\n")
+	TEXT(" 0: disabled;\n")
+	TEXT(" 1: enabled.\n"),
+	ECVF_RenderThreadSafe);
+
 static TAutoConsoleVariable<int32> CVarSimpleTemporalUpscalerYCoCgClamp(
 	TEXT("r.SimpleTemporalUpscaler.YCoCgClamp"),
 	1,
@@ -131,7 +143,8 @@ static TAutoConsoleVariable<int32> CVarSimpleTemporalUpscalerDebugMode(
 	TEXT(" 3: motion confidence;\n")
 	TEXT(" 4: history path classification;\n")
 	TEXT(" 5: dilated velocity usage mask;\n")
-	TEXT(" 6: pixel speed normalized by MotionHistoryMaxSpeed.\n"),
+	TEXT(" 6: pixel speed normalized by MotionHistoryMaxSpeed;\n")
+	TEXT(" 7: lock contribution.\n"),
 	ECVF_RenderThreadSafe);
 
 static TAutoConsoleVariable<int32> CVarSimpleTemporalUpscalerLogStats(
@@ -199,6 +212,20 @@ UE::Renderer::Private::ITemporalUpscaler::FOutputs FSimpleTemporalUpscaler::AddP
 
 	FRDGTextureRef OutputDepthHistoryTexture = GraphBuilder.CreateTexture(OutputDepthHistoryDesc, TEXT("SimpleTemporalUpscaler.OutputDepthHistory"));
 
+	const uint32 bLock = CVarSimpleTemporalUpscalerLock.GetValueOnRenderThread() != 0 ? 1u : 0u;
+
+	FRDGTextureRef OutputLockState = nullptr;
+	FRDGTextureRef PrevLockState = nullptr;
+	if (bLock != 0)
+	{
+		FRDGTextureDesc LockStateDesc = FRDGTextureDesc::Create2D(
+			FIntPoint(Inputs.OutputViewRect.Max.X, Inputs.OutputViewRect.Max.Y),
+			PF_R16F,
+			FClearValueBinding::Black,
+			TexCreate_ShaderResource | TexCreate_UAV);
+		OutputLockState = GraphBuilder.CreateTexture(LockStateDesc, TEXT("SimpleTemporalUpscaler.OutputLockState"));
+	}
+
 	FHistory* PrevHistory = static_cast<FHistory*>(Inputs.PrevHistory.GetReference());
 	const bool bHasHistory =
 		PrevHistory &&
@@ -215,6 +242,10 @@ UE::Renderer::Private::ITemporalUpscaler::FOutputs FSimpleTemporalUpscaler::AddP
 		PrevHistoryTexture = GraphBuilder.RegisterExternalTexture(PrevHistory->ColorHistory, TEXT("SimpleTemporalUpscaler.PrevHistory"));
 		PrevDepthHistoryTexture = GraphBuilder.RegisterExternalTexture(PrevHistory->DepthHistory, TEXT("SimpleTemporalUpscaler.PrevDepthHistory"));
 		PrevHistoryExtent = PrevHistory->Extent;
+		if (bLock != 0 && PrevHistory->LockState.IsValid())
+		{
+			PrevLockState = GraphBuilder.RegisterExternalTexture(PrevHistory->LockState, TEXT("SimpleTemporalUpscaler.PrevLockState"));
+		}
 	}
 
 	const float HistoryWeight = FMath::Clamp(CVarSimpleTemporalUpscalerHistoryWeight.GetValueOnRenderThread(), 0.0f, 1.0f);
@@ -259,12 +290,15 @@ UE::Renderer::Private::ITemporalUpscaler::FOutputs FSimpleTemporalUpscaler::AddP
 	Parameters->PrevHistorySampler = TStaticSamplerState<SF_Bilinear>::GetRHI();
 	Parameters->PrevDepthHistoryTexture = bHasHistory ? PrevDepthHistoryTexture : Inputs.SceneDepth.Texture;
 	Parameters->PrevDepthHistorySampler = TStaticSamplerState<SF_Point>::GetRHI();
+	Parameters->PrevLockState = bLock != 0 && PrevLockState != nullptr ? PrevLockState : Inputs.SceneDepth.Texture;
+	Parameters->PrevLockStateSampler = TStaticSamplerState<SF_Point>::GetRHI();
 	Parameters->SceneVelocityTexture = bUseVelocity ? Inputs.SceneVelocity.Texture : Inputs.SceneColor.Texture;
 	Parameters->SceneVelocitySampler = TStaticSamplerState<SF_Point>::GetRHI();
 	Parameters->SceneDepthTexture = Inputs.SceneDepth.Texture;
 	Parameters->SceneDepthSampler = TStaticSamplerState<SF_Point>::GetRHI();
 	Parameters->OutputTexture = GraphBuilder.CreateUAV(OutputTexture);
 	Parameters->OutputDepthHistoryTexture = GraphBuilder.CreateUAV(OutputDepthHistoryTexture);
+	Parameters->OutputLockState = bLock != 0 ? GraphBuilder.CreateUAV(OutputLockState) : Parameters->OutputDepthHistoryTexture;
 	Parameters->View = View.ViewUniformBuffer;
 	Parameters->CurrentViewRect = FVector4f(
 		Inputs.SceneColor.ViewRect.Min.X,
@@ -296,6 +330,7 @@ UE::Renderer::Private::ITemporalUpscaler::FOutputs FSimpleTemporalUpscaler::AddP
 	Parameters->bDilateVelocity = bDilateVelocity;
 	Parameters->DebugMode = DebugMode;
 	Parameters->bYCoCgClamp = bYCoCgClamp;
+	Parameters->bLock = bLock;
 	Parameters->MotionHistoryMinSpeed = MotionHistoryMinSpeed;
 	Parameters->MotionHistoryMaxSpeed = MotionHistoryMaxSpeed;
 
@@ -312,6 +347,10 @@ UE::Renderer::Private::ITemporalUpscaler::FOutputs FSimpleTemporalUpscaler::AddP
 	NewHistory->Extent = FIntPoint(Inputs.OutputViewRect.Max.X, Inputs.OutputViewRect.Max.Y);
 	GraphBuilder.QueueTextureExtraction(OutputTexture, &NewHistory->ColorHistory);
 	GraphBuilder.QueueTextureExtraction(OutputDepthHistoryTexture, &NewHistory->DepthHistory);
+	if (bLock != 0)
+	{
+		GraphBuilder.QueueTextureExtraction(OutputLockState, &NewHistory->LockState);
+	}
 
 	Outputs.FullRes = FScreenPassTexture(OutputTexture, Inputs.OutputViewRect);
 	Outputs.NewHistory = NewHistory;

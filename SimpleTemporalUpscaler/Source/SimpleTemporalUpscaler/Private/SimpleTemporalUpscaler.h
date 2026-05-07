@@ -13,6 +13,7 @@ public:
 	public:
 		TRefCountPtr<IPooledRenderTarget> ColorHistory;
 		TRefCountPtr<IPooledRenderTarget> DepthHistory;
+		TRefCountPtr<IPooledRenderTarget> LockState;
 		FIntRect ViewRect;
 		FIntPoint Extent = FIntPoint::ZeroValue;
 

@@ -10,6 +10,9 @@ SamplerState PrevHistorySampler;
 Texture2D PrevDepthHistoryTexture;
 SamplerState PrevDepthHistorySampler;
 
+Texture2D PrevLockState;
+SamplerState PrevLockStateSampler;
+
 Texture2D SceneVelocityTexture;
 SamplerState SceneVelocitySampler;
 
@@ -18,6 +21,7 @@ SamplerState SceneDepthSampler;
 
 RWTexture2D<float4> OutputTexture;
 RWTexture2D<float> OutputDepthHistoryTexture;
+RWTexture2D<float> OutputLockState;
 
 float4 CurrentViewRect;
 float4 OutputViewRect;
@@ -33,6 +37,7 @@ uint bMotionAdaptiveHistory;
 uint bDilateVelocity;
 uint DebugMode;
 uint bYCoCgClamp;
+uint bLock;
 float MotionHistoryMinSpeed;
 float MotionHistoryMaxSpeed;
 
@@ -221,6 +226,63 @@ void ComputeCurrentColorNeighborhoodMinMax(float2 CurrentPixelPos, bool bUseYCoC
 	}
 }
 
+bool DetectLockableFeature(float2 CurrentPixelPos)
+{
+	float3 NeighborColors[9];
+	float3 CenterColor;
+
+	for (int LY = -1; LY <= 1; ++LY)
+	{
+		for (int LX = -1; LX <= 1; ++LX)
+		{
+			int Idx = (LY + 1) * 3 + (LX + 1);
+			float2 SamplePos = ClampPixelPosToViewRect(CurrentPixelPos + float2(LX, LY), CurrentViewRect);
+			NeighborColors[Idx] = SampleCurrentSceneColorPoint(SamplePos);
+			if (LX == 0 && LY == 0) CenterColor = NeighborColors[Idx];
+		}
+	}
+
+	float CenterLuma = dot(CenterColor, float3(0.2126, 0.7152, 0.0722));
+	float MaxOtherLuma = -1.0;
+	float MinOtherLuma = 1e10;
+
+	for (int Idx = 0; Idx < 9; ++Idx)
+	{
+		if (Idx == 4) continue;
+		float L = dot(NeighborColors[Idx], float3(0.2126, 0.7152, 0.0722));
+		MaxOtherLuma = max(MaxOtherLuma, L);
+		MinOtherLuma = min(MinOtherLuma, L);
+	}
+
+	const float MinDelta = 0.02;
+	bool bIsPeak   = (CenterLuma > MaxOtherLuma + MinDelta);
+	bool bIsValley = (CenterLuma < MinOtherLuma - MinDelta);
+	return bIsPeak || bIsValley;
+}
+
+float ComputeLockContribution(float CurrentLock)
+{
+	return saturate(CurrentLock);
+}
+
+float UpdateLockState(float CurrentLock, bool bDetected, float DepthConfidence, float MotionConfidence)
+{
+	float NewLock = CurrentLock;
+	if (bDetected && DepthConfidence > 0.5 && MotionConfidence > 0.5)
+	{
+		NewLock = lerp(NewLock, 1.0, 0.3);
+	}
+	else
+	{
+		NewLock *= 0.90;
+		if (DepthConfidence < 0.1 || MotionConfidence < 0.1)
+		{
+			NewLock = 0.0;
+		}
+	}
+	return saturate(NewLock);
+}
+
 [numthreads(8, 8, 1)]
 void MainCS(uint3 DispatchThreadId : SV_DispatchThreadID)
 {
@@ -247,6 +309,10 @@ void MainCS(uint3 DispatchThreadId : SV_DispatchThreadID)
 	float DebugPixelSpeed = 0.0;
 	float3 DebugHistoryPathColor = float3(0.25, 0.0, 0.0);
 	float DebugDilatedVelocity = 0.0;
+	float DebugLock = 0.0;
+
+	float CurrentLock = 0.0;
+	bool bLockDetected = bLock != 0 ? DetectLockableFeature(CurrentPixelPos) : false;
 
 	if (bHasHistory != 0 && HistoryWeight > 0.0)
 	{
@@ -302,11 +368,19 @@ void MainCS(uint3 DispatchThreadId : SV_DispatchThreadID)
 			float2 HistoryUV = HistoryPixelPos * HistoryTextureExtentInverse;
 			float3 PrevColor = PrevHistoryTexture.SampleLevel(PrevHistorySampler, HistoryUV, 0).rgb;
 			float PrevDeviceZ = PrevDepthHistoryTexture.SampleLevel(PrevDepthHistorySampler, HistoryUV, 0).r;
+			float PrevLock = bLock != 0 ? PrevLockState.SampleLevel(PrevLockStateSampler, HistoryUV, 0).r : 0.0;
 			float CurrentLinearDepth = ConvertFromDeviceZ(CurrentDeviceZ);
 			float PrevLinearDepth = ConvertFromDeviceZ(PrevDeviceZ);
 			float DepthDiff = abs(CurrentLinearDepth - PrevLinearDepth);
 			float DepthConfidence = 1.0 - saturate((DepthDiff - 100.0) / 500.0);
 			DebugDepthConfidence = DepthConfidence;
+			float LockContribution = 0.0;
+			if (bLock != 0)
+			{
+				CurrentLock = UpdateLockState(PrevLock, bLockDetected, DepthConfidence, MotionConfidence);
+				LockContribution = ComputeLockContribution(CurrentLock);
+				DebugLock = LockContribution;
+			}
 			float3 CurrentMinColor;
 			float3 CurrentMaxColor;
 
@@ -315,6 +389,7 @@ void MainCS(uint3 DispatchThreadId : SV_DispatchThreadID)
 				ComputeCurrentColorNeighborhoodMinMax(CurrentPixelPos, true, CurrentMinColor, CurrentMaxColor);
 				float3 RangeYCoCg = CurrentMaxColor - CurrentMinColor;
 				float3 YCoCgMargin = float3(0.25, 0.10, 0.10) * max(RangeYCoCg, 1.0 / 255.0);
+				YCoCgMargin = lerp(YCoCgMargin, YCoCgMargin * 2.0, LockContribution);
 				CurrentMinColor -= YCoCgMargin;
 				CurrentMaxColor += YCoCgMargin;
 
@@ -326,6 +401,7 @@ void MainCS(uint3 DispatchThreadId : SV_DispatchThreadID)
 			{
 				ComputeCurrentColorNeighborhoodMinMax(CurrentPixelPos, false, CurrentMinColor, CurrentMaxColor);
 				float3 ClampMargin = max((CurrentMaxColor - CurrentMinColor) * 0.25, 1.0 / 255.0);
+				ClampMargin = lerp(ClampMargin, ClampMargin * 2.0, LockContribution);
 				CurrentMinColor -= ClampMargin;
 				CurrentMaxColor += ClampMargin;
 				PrevColor = clamp(PrevColor, CurrentMinColor, CurrentMaxColor);
@@ -360,8 +436,16 @@ void MainCS(uint3 DispatchThreadId : SV_DispatchThreadID)
 	{
 		OutputColor = saturate(DebugPixelSpeed / max(MotionHistoryMaxSpeed, 1.0e-3)).xxx;
 	}
+	else if (DebugMode == 7)
+	{
+		OutputColor = DebugLock.xxx;
+	}
 
 	uint2 OutputPixelPos = uint2(OutputViewRect.xy) + LocalOutputPixelPos;
 	OutputTexture[OutputPixelPos] = float4(OutputColor, 1.0);
 	OutputDepthHistoryTexture[OutputPixelPos] = CurrentDeviceZ;
+	if (bLock != 0)
+	{
+		OutputLockState[OutputPixelPos] = CurrentLock;
+	}
 }
