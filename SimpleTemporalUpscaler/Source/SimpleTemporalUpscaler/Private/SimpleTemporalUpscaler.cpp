@@ -40,6 +40,7 @@ public:
 		SHADER_PARAMETER(uint32, bMotionAdaptiveHistory)
 		SHADER_PARAMETER(uint32, bDilateVelocity)
 		SHADER_PARAMETER(uint32, DebugMode)
+		SHADER_PARAMETER(uint32, bYCoCgClamp)
 		SHADER_PARAMETER(float, MotionHistoryMinSpeed)
 		SHADER_PARAMETER(float, MotionHistoryMaxSpeed)
 	END_SHADER_PARAMETER_STRUCT()
@@ -110,6 +111,14 @@ static TAutoConsoleVariable<int32> CVarSimpleTemporalUpscalerDilateVelocity(
 	TEXT("Fills missing scene velocity from the nearest-depth valid velocity in a 3x3 neighborhood before history reprojection.\n")
 	TEXT(" 0: disabled;\n")
 	TEXT(" 1: enabled.\n"),
+	ECVF_RenderThreadSafe);
+
+static TAutoConsoleVariable<int32> CVarSimpleTemporalUpscalerYCoCgClamp(
+	TEXT("r.SimpleTemporalUpscaler.YCoCgClamp"),
+	1,
+	TEXT("Uses YCoCg color space for history clamping instead of raw RGB.\n")
+	TEXT(" 0: clamp in RGB space;\n")
+	TEXT(" 1: clamp in YCoCg space with channel-specific margins.\n"),
 	ECVF_RenderThreadSafe);
 
 static TAutoConsoleVariable<int32> CVarSimpleTemporalUpscalerDebugMode(
@@ -214,6 +223,7 @@ UE::Renderer::Private::ITemporalUpscaler::FOutputs FSimpleTemporalUpscaler::AddP
 	const uint32 bMotionAdaptiveHistory = CVarSimpleTemporalUpscalerMotionAdaptiveHistory.GetValueOnRenderThread() != 0 ? 1u : 0u;
 	const uint32 bDilateVelocity = CVarSimpleTemporalUpscalerDilateVelocity.GetValueOnRenderThread() != 0 ? 1u : 0u;
 	const uint32 DebugMode = FMath::Max(CVarSimpleTemporalUpscalerDebugMode.GetValueOnRenderThread(), 0);
+	const uint32 bYCoCgClamp = CVarSimpleTemporalUpscalerYCoCgClamp.GetValueOnRenderThread() != 0 ? 1u : 0u;
 	const float MotionHistoryMinSpeed = FMath::Max(CVarSimpleTemporalUpscalerMotionHistoryMinSpeed.GetValueOnRenderThread(), 0.0f);
 	const float MotionHistoryMaxSpeed = FMath::Max(CVarSimpleTemporalUpscalerMotionHistoryMaxSpeed.GetValueOnRenderThread(), MotionHistoryMinSpeed + 0.001f);
 
@@ -285,6 +295,7 @@ UE::Renderer::Private::ITemporalUpscaler::FOutputs FSimpleTemporalUpscaler::AddP
 	Parameters->bMotionAdaptiveHistory = bMotionAdaptiveHistory;
 	Parameters->bDilateVelocity = bDilateVelocity;
 	Parameters->DebugMode = DebugMode;
+	Parameters->bYCoCgClamp = bYCoCgClamp;
 	Parameters->MotionHistoryMinSpeed = MotionHistoryMinSpeed;
 	Parameters->MotionHistoryMaxSpeed = MotionHistoryMaxSpeed;
 

@@ -32,6 +32,7 @@ uint CurrentFrameDejitterMode;
 uint bMotionAdaptiveHistory;
 uint bDilateVelocity;
 uint DebugMode;
+uint bYCoCgClamp;
 float MotionHistoryMinSpeed;
 float MotionHistoryMaxSpeed;
 
@@ -183,7 +184,23 @@ bool ComputeCameraPrevOutputUV(float2 CurrentPixelPos, float CurrentDeviceZ, flo
 	return true;
 }
 
-void ComputeCurrentColorNeighborhoodMinMax(float2 CurrentPixelPos, out float3 OutMinColor, out float3 OutMaxColor)
+float3 RGBToYCoCg(float3 C)
+{
+	float Y  = dot(C, float3(0.25, 0.5, 0.25));
+	float Co = dot(C, float3(0.5,  0.0, -0.5));
+	float Cg = dot(C, float3(-0.25, 0.5, -0.25));
+	return float3(Y, Co, Cg);
+}
+
+float3 YCoCgToRGB(float3 C)
+{
+	return float3(
+		C.x + C.y - C.z,
+		C.x + C.z,
+		C.x - C.y - C.z);
+}
+
+void ComputeCurrentColorNeighborhoodMinMax(float2 CurrentPixelPos, bool bUseYCoCg, out float3 OutMinColor, out float3 OutMaxColor)
 {
 	OutMinColor = float3(65504.0, 65504.0, 65504.0);
 	OutMaxColor = float3(-65504.0, -65504.0, -65504.0);
@@ -194,6 +211,10 @@ void ComputeCurrentColorNeighborhoodMinMax(float2 CurrentPixelPos, out float3 Ou
 		{
 			float2 SamplePixelPos = ClampPixelPosToViewRect(CurrentPixelPos + float2(X, Y), CurrentViewRect);
 			float3 SampleColor = SampleCurrentSceneColorPoint(SamplePixelPos);
+			if (bUseYCoCg)
+			{
+				SampleColor = RGBToYCoCg(SampleColor);
+			}
 			OutMinColor = min(OutMinColor, SampleColor);
 			OutMaxColor = max(OutMaxColor, SampleColor);
 		}
@@ -288,11 +309,27 @@ void MainCS(uint3 DispatchThreadId : SV_DispatchThreadID)
 			DebugDepthConfidence = DepthConfidence;
 			float3 CurrentMinColor;
 			float3 CurrentMaxColor;
-			ComputeCurrentColorNeighborhoodMinMax(CurrentPixelPos, CurrentMinColor, CurrentMaxColor);
-			float3 ClampMargin = max((CurrentMaxColor - CurrentMinColor) * 0.25, 1.0 / 255.0);
-			CurrentMinColor -= ClampMargin;
-			CurrentMaxColor += ClampMargin;
-			PrevColor = clamp(PrevColor, CurrentMinColor, CurrentMaxColor);
+
+			if (bYCoCgClamp != 0)
+			{
+				ComputeCurrentColorNeighborhoodMinMax(CurrentPixelPos, true, CurrentMinColor, CurrentMaxColor);
+				float3 RangeYCoCg = CurrentMaxColor - CurrentMinColor;
+				float3 YCoCgMargin = float3(0.25, 0.10, 0.10) * max(RangeYCoCg, 1.0 / 255.0);
+				CurrentMinColor -= YCoCgMargin;
+				CurrentMaxColor += YCoCgMargin;
+
+				float3 PrevYCoCg = RGBToYCoCg(PrevColor);
+				PrevYCoCg = clamp(PrevYCoCg, CurrentMinColor, CurrentMaxColor);
+				PrevColor = YCoCgToRGB(PrevYCoCg);
+			}
+			else
+			{
+				ComputeCurrentColorNeighborhoodMinMax(CurrentPixelPos, false, CurrentMinColor, CurrentMaxColor);
+				float3 ClampMargin = max((CurrentMaxColor - CurrentMinColor) * 0.25, 1.0 / 255.0);
+				CurrentMinColor -= ClampMargin;
+				CurrentMaxColor += ClampMargin;
+				PrevColor = clamp(PrevColor, CurrentMinColor, CurrentMaxColor);
+			}
 			float EffectiveHistoryWeight = HistoryWeight * DepthConfidence * MotionConfidence;
 			DebugEffectiveHistoryWeight = EffectiveHistoryWeight;
 			OutputColor = lerp(CurrentColor, PrevColor, EffectiveHistoryWeight);
