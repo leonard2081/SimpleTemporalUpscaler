@@ -367,6 +367,7 @@ void MainCS(uint3 DispatchThreadId : SV_DispatchThreadID)
 			float2 HistoryPixelPos = ClampPixelPosToViewRect(OutputViewRect.xy + PrevOutputUV * OutputViewRect.zw, OutputViewRect);
 			float2 HistoryUV = HistoryPixelPos * HistoryTextureExtentInverse;
 			float3 PrevColor = PrevHistoryTexture.SampleLevel(PrevHistorySampler, HistoryUV, 0).rgb;
+			float3 PrevColorUnclamped = PrevColor;
 			float PrevDeviceZ = PrevDepthHistoryTexture.SampleLevel(PrevDepthHistorySampler, HistoryUV, 0).r;
 			float PrevLock = bLock != 0 ? PrevLockState.SampleLevel(PrevLockStateSampler, HistoryUV, 0).r : 0.0;
 			float CurrentLinearDepth = ConvertFromDeviceZ(CurrentDeviceZ);
@@ -389,23 +390,20 @@ void MainCS(uint3 DispatchThreadId : SV_DispatchThreadID)
 				ComputeCurrentColorNeighborhoodMinMax(CurrentPixelPos, true, CurrentMinColor, CurrentMaxColor);
 				float3 RangeYCoCg = CurrentMaxColor - CurrentMinColor;
 				float3 YCoCgMargin = float3(0.25, 0.10, 0.10) * max(RangeYCoCg, 1.0 / 255.0);
-				YCoCgMargin = lerp(YCoCgMargin, YCoCgMargin * 2.0, LockContribution);
-				CurrentMinColor -= YCoCgMargin;
-				CurrentMaxColor += YCoCgMargin;
 
 				float3 PrevYCoCg = RGBToYCoCg(PrevColor);
-				PrevYCoCg = clamp(PrevYCoCg, CurrentMinColor, CurrentMaxColor);
+				PrevYCoCg = clamp(PrevYCoCg, CurrentMinColor - YCoCgMargin, CurrentMaxColor + YCoCgMargin);
 				PrevColor = YCoCgToRGB(PrevYCoCg);
 			}
 			else
 			{
 				ComputeCurrentColorNeighborhoodMinMax(CurrentPixelPos, false, CurrentMinColor, CurrentMaxColor);
 				float3 ClampMargin = max((CurrentMaxColor - CurrentMinColor) * 0.25, 1.0 / 255.0);
-				ClampMargin = lerp(ClampMargin, ClampMargin * 2.0, LockContribution);
 				CurrentMinColor -= ClampMargin;
 				CurrentMaxColor += ClampMargin;
 				PrevColor = clamp(PrevColor, CurrentMinColor, CurrentMaxColor);
 			}
+			PrevColor = lerp(PrevColor, PrevColorUnclamped, LockContribution);
 			float EffectiveHistoryWeight = HistoryWeight * DepthConfidence * MotionConfidence;
 			DebugEffectiveHistoryWeight = EffectiveHistoryWeight;
 			OutputColor = lerp(CurrentColor, PrevColor, EffectiveHistoryWeight);
