@@ -1,0 +1,19 @@
+{
+	"FileVersion": 3,
+	"Version": 1,
+	"VersionName": "1.0",
+	"FriendlyName": "Simple Temporal Upscaler",
+	"Description": "Minimal skeleton for a custom temporal upscaler using Unreal Engine's ITemporalUpscaler interface.",
+	"Category": "Rendering",
+	"CreatedBy": "GUSD",
+	"EnabledByDefault": false,
+	"CanContainContent": false,
+	"IsBetaVersion": true,
+	"Modules": [
+		{
+			"Name": "SimpleTemporalUpscaler",
+			"Type": "Runtime",
+			"LoadingPhase": "Default"
+		}
+	]
+}
