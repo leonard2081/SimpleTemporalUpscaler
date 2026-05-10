@@ -398,3 +398,313 @@ uint2 OutputPixelPos = bValidOutputPixel ? InputPixelPos : uint(~0).xx;
 ```
 
 `uint(~0).xx` = `(0xFFFFFFFF, 0xFFFFFFFF)`。无效像素写入 UINT_MAX 地址，GPU 丢弃该写操作——用三元表达式替代显式 `if` 分支，对 wave 内分支发散更友好。
+
+---
+
+## 3. Pass: DecimateHistory
+
+**源文件**: `Engine/Shaders/Private/TemporalSuperResolution/TSRDecimateHistory.usf`
+**C++ 调度**: `TemporalSuperResolution.cpp:2082`
+
+### 3.1 概述
+
+DecimateHistory 是 TSR 重投影的核心 pass，负责：
+1. 读取膨胀后的 MV 邻域，做更精确的运动边缘检测
+2. 用膨胀 MV 重投影到上一帧，采样历史颜色和深度
+3. 通过深度比对判断 disocclusion
+4. 在 disocclusion 区域尝试补洞（hole-filling）
+5. 输出重投影后的历史颜色、降采样 MV、像素状态标志位
+
+### 3.2 输入纹理
+
+| 纹理 | 来源 | 内容 |
+|------|------|------|
+| `DilatedReprojectionVectorTexture` | DilateVelocity ReprojectionFieldOutput slice[0] 或 slice[3] | 膨胀后的 MV |
+| `DilateMaskTexture` | DilateVelocity R8Output slice[0] | ReprojectionEdge + HasReprojectionOffset |
+| `DepthErrorTexture` | DilateVelocity R8Output slice[1] | DeviceZError |
+| `ClosestDepthTexture` | DilateVelocity ClosestDepthOutput | `.r`=PrevClosestDeviceZ, `.g`=ClosestDeviceZ |
+| `PrevAtomicTextureArray` | DilateVelocity 散射写入的 `TSR.PrevAtomics` | 散射的最近深度 + hole-filling velocity |
+| `PrevHistoryGuide` | 上一帧 RejectShading 输出的 `TSR.History.Guide` | 历史帧引导颜色 |
+
+### 3.3 坐标映射：Map8x8Tile2x2Lane
+
+```hlsl
+tsr_ushort2 InputPixelPos = Map8x8Tile2x2Lane(GroupThreadIndex)
+    + tsr_ushort2(InputInfo_ViewportMin) + tsr_ushort2(GroupId) * tsr_ushort2(8, 8);
+```
+
+与 DilateVelocity 使用 `ZOrder2D` 不同，DecimateHistory 使用 `Map8x8Tile2x2Lane`（不同映射方式），但本质相同——将 1D 线程索引映射到 2D 像素坐标。
+
+### 3.4 读取预处理数据
+
+```hlsl
+uint EncodedDilateMask = DilateMaskTexture[InputPixelPos];
+uint EncodedDeviceZError = DepthErrorTexture[InputPixelPos];
+float2 DeviceZAndPrevDeviceZ = ClosestDepthTexture[InputPixelPos];
+
+bHasReprojectionOffset = (EncodedDilateMask & 0x80u) != 0;
+PremilinaryReprojectionEdge = (EncodedDilateMask & 0x7Fu) / 127.0;
+PrevDeviceZ = abs(DeviceZAndPrevDeviceZ.r);
+DeviceZError = DecodeDeviceZError(PrevDeviceZ, EncodedDeviceZError);
+```
+
+将 DilateVelocity 编码在 R8 纹理中的元数据解码还原。
+
+### 3.5 FetchReprojectionNeighborhood：读取膨胀 MV 邻域
+
+```hlsl
+FetchReprojectionNeighborhood(DilatedReprojectionVectorTexture, InputPixelPos,
+    EncodedReprojectionVectorNeighborhood);
+DilatedEncodedReprojectionVector = AccessNeighborhoodCenter(...);  // 中心膨胀 MV
+```
+
+读取 3×3 邻域的膨胀 MV（butterfly 采样），目的有两个：
+
+1. **中心 MV 用于历史重投影**：`AccessNeighborhoodCenter` 取当前像素自己的膨胀 MV
+2. **邻域 MV 用于精确边缘检测**：调用 9-samples 版 `ComputeReprojectionEdge`，对比中心与所有邻居的速度差异
+
+```hlsl
+ComputePixelVelocityNeighborhood(EncodedReprojectionVectorNeighborhood, PixelVelocityNeighborhood);
+ReprojectionEdge = ComputeReprojectionEdge(PixelVelocityNeighborhood);  // 9-sample 版本
+
+// 取两轮检测的保守值
+ReprojectionEdge = select(PremilinaryReprojectionEdge > 0.9, 
+    PremilinaryReprojectionEdge,     // DilateVelocity 的初步结果
+    ReprojectionEdge);               // 本 pass 完整邻域分析
+
+// 没有重投影偏移 → 不是边缘
+ReprojectionEdge = select(bHasReprojectionOffset, ReprojectionEdge, 1.0);
+```
+
+### 3.6 LDS Spill：手动寄存器换 LDS
+
+```hlsl
+groupshared uint  SharedArray0[64];
+groupshared float SharedArray1[64];
+
+// 写入 LDS，释放 VGPR
+SharedArray0[GroupThreadIndex] = DilatedEncodedReprojectionVector;
+SharedArray1[GroupThreadIndex] = PrevDeviceZ;
+
+// ========== ReprojectAllPrevTextures (消耗大量 VGPR) ==========
+
+// 从 LDS 恢复
+DilatedEncodedReprojectionVector = SharedArray0[GroupThreadIndex];
+PrevDeviceZ = SharedArray1[GroupThreadIndex];
+```
+
+历史纹理采样（`ReprojectAllPrevTextures`）消耗大量 VGPR。先将变量暂存 LDS，编译器可回收 VGPR 供采样使用，采样完成后再恢复。LDS 延迟约 16~32 cycles，比 VGPR spill 到显存快。
+
+### 3.7 ReprojectAllPrevTextures：历史重投影
+
+#### 3.7.1 两步重投影
+
+```hlsl
+// ① 低分辨率：读 PrevAtomics 深度（双线性 4 点）
+float2 ScreenPos = PixelsToScreen(InputPixelPos);
+float2 PrevScreenPos = ScreenPos - DilatedMV;
+LoadPrevAtomicTexturesSamples(PrevAtomicTextureArray, PrevScreenPos,
+    HistoryClosestDeviceZSamples0[4]);  // 4 个角点深度
+
+// ② 高分辨率：读 PrevHistoryGuide 颜色（CatmullRom 采样）
+float2 OutputScreenPos = PixelsToReprojectScreen(InputPixelPos);
+float2 PrevOutputScreenPos = OutputScreenPos - DilatedMV;
+ReprojectedHistoryGuideSamples.FetchSamples(PrevHistoryGuide, PrevOutputScreenPos);
+```
+
+注意两个步骤使用**不同的 ScreenPos 变换**——深度在低分辨率 `PrevAtomics` 空间采样，颜色在高分辨率 `PrevHistoryGuide` 空间采样，两者分辨率不同。
+
+#### 3.7.2 LoadPrevAtomicTexturesSamples
+
+将重投影后的 screen position 转为 PrevAtomics 缓冲的 UV，取**双线性采样的 4 个角点整像素**：
+
+```hlsl
+float2 PrevInputBufferUV = (ScreenPosToViewportScale * PrevScreenPos + Bias) / Extent;
+FBilinearSampleInfos BilinearInter = GetBilinearSampleLevelInfos(PrevInputBufferUV, ...);
+
+for (uint i = 0; i < 4; i++)
+    HistoryClosestDeviceZSamples0[i] = PrevAtomicTextureArray[uint3(PixelPos, 0)];
+```
+
+每个采样点存打包的 `f16(深度) + hole-filling velocity`。
+
+#### 3.7.3 CameraCut 处理
+
+无历史时（首帧 / CameraCut）：
+- C++ 侧：`PrevHistory.GuideArray = BlackArrayDummy`（全零纹理）
+- Shader 侧：`bIsOffScreen = (bCameraCut != 0) || ...` → 标记为无效
+- 采样结果全零，后续 pass 直接用当前帧颜色，不混入历史
+
+### 3.8 颜色累积与曝光校正
+
+```hlsl
+// CatmullRom 多采样点合并
+tsr_half4 RawGuide = ReprojectedHistoryGuideSamples.AccumulateSamples();
+ReprojectedHistoryGuideColor = RawGuide.rgb;
+ReprojectedHistoryGuideUncertainty = RawGuide.a;
+
+// 还原曝光校正（历史帧存的是预曝光校正后的值）
+ReprojectedHistoryGuideColor = CorrectGuideColorExposure(ReprojectedHistoryGuideColor, 
+    HistoryPreExposureCorrection);
+```
+
+### 3.9 ProcessPrevAtomicTexturesSamples：Disocclusion 检测与补洞
+
+#### 3.9.1 输入参数
+
+```
+ScreenPos ([-1,1])           = 当前像素 NDC 坐标
+ScreenVelocity ([-1,1])      = 膨胀后的 MV（解码自 DilatedEncodedReprojectionVector）
+PrevDeviceZ                  = ClosestDeviceZ - DilatedScreenVelocity.z（最近深度投射到上一帧）
+HistoryClosestDeviceZSamples0[4] = 上一帧散射纹理双线性 4 采样点
+DeviceZError                 = 深度误差容差
+```
+
+#### 3.9.2 Disocclusion 判断
+
+```hlsl
+// 4 个采样点逐一比对
+for (uint i = 0; i < 4; i++)
+{
+    float HistoryClosestDeviceZ = f16tof32(SampleHistoryClosestDeviceZ >> 18);  // 解码深度
+    float HistoryClosestWorldDepth = ConvertFromDeviceZ(HistoryClosestDeviceZ);
+    
+    float WorldDepthEpsilon = GetDepthPixelRadiusForProjectionType(HistoryClosestWorldDepth) * 3.0 * 2.0;
+    float DeltaDepth = abs(HistoryClosestWorldDepth - WorldDepth);
+    DepthRejection = saturate(2.0 - DeltaDepth / WorldDepthEpsilon);
+    
+    ParallaxRejectionMask += BilinearWeight * DepthRejection;  // 累加
+}
+```
+
+比对 `PrevDeviceZ`（按 MV 推算的上一帧深度）和 `HistoryClosestDeviceZSamples0`（上一帧实际散射的最近深度）：
+- 一致 → `DepthRejection ≈ 1.0` → 高 rejection mask → 正常重投影
+- 不一致 → `DepthRejection ≈ 0.0` → 低 rejection mask → disocclusion
+
+#### 3.9.3 补洞 MV 解码
+
+```hlsl
+// 4 个样本取 max（高位是深度，max 自然选中最近遮挡物对应的打包值）
+EncodedHoleFillingVelocity = max(EncodedHoleFillingVelocity, SampleHistoryClosestDeviceZ);
+
+// 解码 hole-filling velocity
+DecodeHoleFillingVelocity(EncodedHoleFillingVelocity, angle, length);
+HoleFillingPixelVelocity = CartesianHoleFillingVelocity(angle, length);  // 极坐标 → 像素坐标
+```
+
+补洞 MV 就是膨胀 MV 本身——在 `ScatterClosestOccluder` 中打包写入的相同值，只是经过极坐标编码/解码。
+
+#### 3.9.4 补洞有效性判断
+
+```hlsl
+// 判断 1: 长度是否在可编码范围内
+bool bIsEncodablePixelLength = HoleFillingPixelLength < GetMaxEncodableHoleFillingPixelLength();
+
+// 判断 2: 至少一个采样点有效
+bool bIsValidHoleFillingPixelVelocity;  // 至少一个 PixelPos 在视口内
+
+bCanHoleFill = bIsValidHoleFillingPixelVelocity && bIsEncodablePixelLength;
+```
+
+编码使用固定 bit 位宽，长度超过可编码范围会被 `clamp` 截断。解码值是编码最大值 → 可能因溢出被截断，真实长度未知 → 不可靠，放弃补洞。
+
+#### 3.9.5 补洞 MV 与当前 MV 交叉验证
+
+```hlsl
+// 如果补洞 MV 方向和大小 ≈ 当前膨胀 MV → 运动一致
+if (bIsEncodablePixelLength)
+{
+    float PixelAngleDiff = abs(PixelVelocityAngle - HoleFillingPixelAngle);
+    float PixelLengthDiff = abs(HoleFillingPixelLength - PixelVelocityLength) - 2.0;
+    
+    // 角度相似 → 提升 rejection mask
+    ParallaxRejectionMask = max(ParallaxRejectionMask, CompareSimilarity(...));
+}
+```
+
+两个速度相似意味着运动和周围一致，不是真正的遮挡边缘，提升 rejection mask 避免误判。
+
+#### 3.9.6 补洞 MV 替换膨胀 MV
+
+```hlsl
+bReprojectionHollFill = bCanHoleFill && bIsParallaxDisocclusion;
+
+if (bReprojectionHollFill)
+{
+    float2 HoleFillingReprojectionVector = HoleFillingPixelVelocity * InputPixelVelocityToScreenVelocity;
+    DilatedEncodedReprojectionVector = EncodeReprojectionVector(HoleFillingReprojectionVector);
+}
+```
+
+补洞原理：disocclusion 区域的像素在上帧被前景遮挡 → 用前景的 MV（即膨胀 MV/补洞 MV）去历史帧前景曾覆盖的位置采样 → 那里就是本应出现的背景颜色。
+
+### 3.10 输出
+
+#### 3.10.1 DecimateBitMask：像素状态标志位
+
+```hlsl
+tsr_ushort DecimateBitMask = 
+    select(bIsOffScreen,             bit0) |
+    select(bIsParallaxDisocclusion,  bit1) |
+    select(bHasPixelAnimation,       bit2) |
+    select(bReprojectionHollFill,    bit3) |
+    select(bIsResurrectionOffScreen, bit4);
+```
+
+| Bit | 标志 | 含义 |
+|-----|------|------|
+| 0 | `bIsOffScreen` | 重投影越界/CameraCut |
+| 1 | `bIsParallaxDisocclusion` | 视差遮挡 |
+| 2 | `bHasPixelAnimation` | 像素动画 |
+| 3 | `bReprojectionHollFill` | 补洞有效 |
+| 4 | `bIsResurrectionOffScreen` | resurrection 越界 |
+
+后续 `ResolveHistory` / `RejectShading` 根据这些标志决定如何混合历史。
+
+#### 3.10.2 输出纹理汇总
+
+| 输出 | 内容 | 使用者 |
+|------|------|--------|
+| `ReprojectedHistoryGuideOutput` | 重投影后的历史颜色 + uncertainty | ResolveHistory, RejectShading |
+| `DecimateMaskOutput` | `.r`=DecimateBitMask/255, `.g`=ReprojectionEdge | ResolveHistory, RejectShading |
+| `ReprojectionFieldOutput` | 降采样后的重投影 MV（补洞像素用补洞 MV 替换） | UpdateHistory |
+
+#### 3.10.3 补洞像素对 ReprojectionFieldOutput 的特殊处理
+
+```hlsl
+// 始终写入 MV（补洞像素已替换为补洞 MV）
+ReprojectionFieldOutput[kReprojectionVectorOutputIndex] = DilatedEncodedReprojectionVector;
+
+// Jacobian 清零（补洞区域亚像素形变不可知，不做修正）
+ReprojectionFieldOutput[kReprojectionJacobianOutputIndex] = EncodeReprojectionJacobian(0.0);
+```
+
+### 3.11 随机抖动量化（Stochastic Quantization）
+
+```hlsl
+uint2 Random = Rand3DPCG16(int3(InputPixelPos - ViewportMin, View.StateFrameIndexMod8)).xy;
+tsr_half E = Hammersley16(0, 1, Random).x;
+
+ReprojectedHistoryGuideColor = QuantizeForUNormRenderTarget(
+    ReprojectedHistoryGuideColor, E, HistoryGuideQuantizationError);
+```
+
+原理：`Color = Color + QuantizationError * (E - 0.5)`，其中 `E ∈ [0,1]` 是伪随机数。
+
+历史 guide 纹理存 HDR 颜色但格式精度有限（如 R11G11B10），直接截断产生条带噪声。抖动将量化误差转为每帧不同的高频噪声，TAA 多帧累积后平均收敛到正确值，等价于提升有效位深。
+
+### 3.12 GuideColor 数据流
+
+| 阶段 | Pass | 纹理 | 作用 |
+|------|------|------|------|
+| 当前帧使用 | **DecimateHistory** | `ReprojectedHistoryGuideOutput` | 从 PrevHistoryGuide 重投影得到中间结果 |
+| 下一帧使用 | **RejectShading** | `HistoryGuideOutput` → `History.GuideArray` | 混合当前帧与历史后写入，存为下帧 PrevHistoryGuide |
+
+```
+PrevHistoryGuide (上帧 RejectShading 存下的)
+  → DecimateHistory 重投影采样
+  → ReprojectedHistoryGuide (中间结果)
+  → ResolveHistory 上采样
+  → RejectShading: 当前帧 vs 历史判定混合
+  → History.GuideArray → QueueTextureExtraction → 下一帧的 PrevHistoryGuide
+```
