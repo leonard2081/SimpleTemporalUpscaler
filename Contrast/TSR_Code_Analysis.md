@@ -500,19 +500,19 @@ PrevDeviceZ = SharedArray1[GroupThreadIndex];
 #### 3.7.1 两步重投影
 
 ```hlsl
-// ① 低分辨率：读 PrevAtomics 深度（双线性 4 点）
+// ① 读 PrevAtomics 深度（双线性 4 点，低清 InputExtent 坐标系）
 float2 ScreenPos = PixelsToScreen(InputPixelPos);
 float2 PrevScreenPos = ScreenPos - DilatedMV;
 LoadPrevAtomicTexturesSamples(PrevAtomicTextureArray, PrevScreenPos,
     HistoryClosestDeviceZSamples0[4]);  // 4 个角点深度
 
-// ② 高分辨率：读 PrevHistoryGuide 颜色（CatmullRom 采样）
+// ② 读 PrevHistoryGuide 颜色（CatmullRom 采样，低清 GuideArray 坐标系）
 float2 OutputScreenPos = PixelsToReprojectScreen(InputPixelPos);
 float2 PrevOutputScreenPos = OutputScreenPos - DilatedMV;
 ReprojectedHistoryGuideSamples.FetchSamples(PrevHistoryGuide, PrevOutputScreenPos);
 ```
 
-注意两个步骤使用**不同的 ScreenPos 变换**——深度在低分辨率 `PrevAtomics` 空间采样，颜色在高分辨率 `PrevHistoryGuide` 空间采样，两者分辨率不同。
+注意两个步骤使用**不同的 ScreenPos → 纹理坐标变换**——`PrevAtomics` 和 `PrevHistoryGuide` 虽然都在低清分辨率下，但纹理尺寸和视口参数可能因量化对齐不同，因此需要各自的 transform。Guide 颜色和 PrevAtomics 深度同属低清坐标系。
 
 #### 3.7.2 LoadPrevAtomicTexturesSamples
 
@@ -695,16 +695,309 @@ ReprojectedHistoryGuideColor = QuantizeForUNormRenderTarget(
 
 ### 3.12 GuideColor 数据流
 
+> **注意：Guide 颜色是低清分辨率的。** RejectShading 以 `InputRect.Size()` 派遣线程，写入 `History.GuideArray` 的视口区域。`History.GuideArray` 的物理 extent 可能因量化对齐稍大，但有效数据仅填充低清视口范围。
+
 | 阶段 | Pass | 纹理 | 作用 |
 |------|------|------|------|
-| 当前帧使用 | **DecimateHistory** | `ReprojectedHistoryGuideOutput` | 从 PrevHistoryGuide 重投影得到中间结果 |
-| 下一帧使用 | **RejectShading** | `HistoryGuideOutput` → `History.GuideArray` | 混合当前帧与历史后写入，存为下帧 PrevHistoryGuide |
+| 当前帧使用 | **DecimateHistory** | `ReprojectedHistoryGuideOutput` | 从 PrevHistoryGuide 重投影得到中间结果（低清） |
+| 下一帧使用 | **RejectShading** | `HistoryGuideOutput` → `History.GuideArray` | 混合当前帧与历史后写入低清视口区域，存为下帧 PrevHistoryGuide |
 
 ```
-PrevHistoryGuide (上帧 RejectShading 存下的)
-  → DecimateHistory 重投影采样
-  → ReprojectedHistoryGuide (中间结果)
-  → ResolveHistory 上采样
-  → RejectShading: 当前帧 vs 历史判定混合
-  → History.GuideArray → QueueTextureExtraction → 下一帧的 PrevHistoryGuide
+PrevHistoryGuide (上帧 RejectShading 存下的，低清)
+  → DecimateHistory 重投影采样（低清坐标系）
+  → ReprojectedHistoryGuide (中间结果，低清)
+  → RejectShading: 当前帧 vs 历史判定混合（低清线程派遣）
+  → History.GuideArray（低清有效区域） → QueueTextureExtraction
+  → 下一帧的 PrevHistoryGuide（同样是低清）
+
+注意：最终高清画面走的是 History.ColorArray（UpdateHistory pass 写入，输出分辨率），
+Guide 只负责时序判定和亮度引导，始终运行在低清分辨率下。
 ```
+
+---
+
+## 4. Pass: RejectShading
+
+**源文件**: `Engine/Shaders/Private/TemporalSuperResolution/TSRRejectShading.usf`
+**C++ 调度**: `TemporalSuperResolution.cpp:2380`
+
+### 4.1 概述
+
+RejectShading 是 TSR 时序稳定性决策的最终关口，负责：
+1. 读取当前帧颜色和历史重投影颜色
+2. 通过卷积网络做时序分析（shading rejection）
+3. 计算当前帧与历史帧的混合比例（RejectionBlendFinal）
+4. 生成下一帧使用的 Guide 颜色
+
+### 4.2 线程模型：Lane + SIMD + Tensor
+
+```hlsl
+[numthreads(LANE_COUNT * WAVE_COUNT, 1, 1)]  // 如 64×1 = 64 threads
+```
+
+与前几个 pass 不同，RejectShading 使用**卷积网络架构**的线程模型：
+
+| 概念 | 说明 |
+|------|------|
+| **Lane** | 硬件执行槽位，1 thread = 1 lane |
+| **LaneStride** | 每个 lane 覆盖的空间范围（如 2×2=4 像素） |
+| **SIMD_SIZE** | 每个线程向量化处理的像素数（通常 4） |
+| **tsr_tensor** | 打包 `SIMD_SIZE` 个向量的张量类型 |
+
+```hlsl
+// tsr_tensor 类型定义（本质是 TLaneVector2D）
+tsr_tensor_halfC  = TLaneVector2D<tsr_half, C, LaneStrideX, LaneStrideY>  // C 通道 × 4 像素
+tsr_tensor_bool   = TLaneVector2D<bool,    1, LaneStrideX, LaneStrideY>  // 4 个布尔
+tsr_tensor_short2 = TLaneVector2D<tsr_short, 2, LaneStrideX, LaneStrideY> // 4 个 (x,y)
+tsr_tensor_half   = TLaneVector2D<tsr_half, 1, LaneStrideX, LaneStrideY>  // 4 个标量
+```
+
+所有核心数据都以张量形式流转——每个变量包含 `SIMD_SIZE` 个像素的值，通过 `ElementIndex` 循环处理。
+
+### 4.3 像素坐标批量计算
+
+```hlsl
+tsr_tensor_short2 ComputePixelPos()
+{
+    tsr_tensor_short2 PixelPos;
+    for (uint i = 0; i < SIMD_SIZE; i++)
+        PixelPos.SetElement(i, ComputeElementPixelPos(i));
+    return PixelPos;  // 4 个相邻像素坐标
+}
+```
+
+坐标计算使用 `TileOverscan`（tile 间重叠）和 `LaneStride`，每个 lane 负责 2×2 连续像素块，无遗漏无重复。输出坐标由 `ComputeElementOutputPixelPos` 钳位到 `InputInfo_ViewportMin ~ InputInfo_ViewportMax`。
+
+### 4.4 输入纹理
+
+| 纹理 | 来源 | 内容 |
+|------|------|------|
+| `InputTexture` | `PassInputs.SceneColor.Texture` | 当前帧低清不透明颜色 |
+| `InputSceneTranslucencyTexture` | `PostDOFTranslucencyResources` | DOF 后的分离半透明 |
+| `ReprojectedHistoryGuideTexture` | DecimateHistory 输出 | 重投影后的历史引导色 + uncertainty |
+| `DecimateMaskTexture` | DecimateHistory 输出 | `.r`=BitMask, `.g`=ReprojectionEdge |
+| `IsMovingMaskTexture` | DilateVelocity R8Output slice[2] | 闪烁检测标志 |
+| `ClosestDepthTexture` | DilateVelocity ClosestDepthOutput | 最近深度 |
+
+### 4.5 FetchDecimateMask：读取像素状态
+
+```hlsl
+void FetchDecimateMask(PixelPos, out VelocityEdge, out bIsDisoccluded, ...)
+{
+    DecimateMask = DecimateMaskTexture[PixelPos[i]];
+    BitMask = DecimateMask.r * 255;
+    bIsDisoccluded[i] = (BitMask & 0x3) != 0;       // bit 0: off-screen, bit 1: disocclusion
+    bHasPixelAnimation[i] = (BitMask & 0x4) != 0;   // bit 2
+    VelocityEdge[i] = DecimateMask.g;                // ReprojectionEdge
+}
+```
+
+### 4.6 FetchSceneColorAndTranslucency：读取当前帧颜色
+
+```hlsl
+OriginalOpaqueInput[i] = InputTexture[PixelPos[i]];                 // 不透明颜色
+OriginalTranslucencyInput[i] = InputSceneTranslucencyTexture[UV[i]]; // 半透明
+```
+
+`InputTexture` 是 Base Pass 的不透明渲染结果，`InputSceneTranslucencyTexture` 是 DOF 后单独渲染的半透明层——两者分离是因为半透明在 DOF 之后渲染，不能直接写回 SceneColor。
+
+#### 两次合成：用途不同
+
+**ComposeTranslucency**（输出用）：
+```hlsl
+CenterFinalSceneColor = Opaque * Alpha + Translucency;  // 标准合成
+// → 写入 InputSceneColorOutput 和 LDR Luma
+```
+
+**ComposeTranslucencyForRejection**（时序判定用）：
+```hlsl
+if (bHasPixelAnimation) {
+    SharpInput = 0;                               // 不透明清零（不可靠）
+    BlurInput = 合成颜色;                         // 半透明用完整颜色替换
+}
+return ComposeTranslucency(SharpInput, Blur3x3(BlurInput)); // 半透明 3×3 模糊
+```
+
+**分离原因**：Pixel Animation 和半透明区域天生时序不稳定，直接用精确颜色比对会大量误判。`ComposeTranslucencyForRejection` 先把不稳定区域模糊化，让 rejection 更保守。
+
+### 4.7 Pixel Animation
+
+速度缓冲中的标志位，标记**像素着色自身在变化**而非物体移动（如 flipbook 序列帧、UV 滚动、程序化噪声动画）。历史重投影无法通过 MV 精确对齐这种变化，shading rejection 需特殊处理——检测到 PA 的像素，把不透明部分清零、半透明模糊化，降低时序比较灵敏度。
+
+### 4.8 FetchReprojectedHistoryGuide：读取历史引导色
+
+```hlsl
+FetchHistoryGuide(ReprojectedHistoryGuideTexture, 
+    ReprojectedHistoryGuideMetadataTexture, PixelPos,
+    out History, out HistoryUncertainty);
+```
+
+两个纹理实际是同一纹理数组的不同 slice：
+- 无 Alpha 路径：`ReprojectedHistoryGuideTexture.rgb`=颜色, `.a`=uncertainty
+- 有 Alpha 路径：`ReprojectedHistoryGuideTexture.rgba`=颜色+Alpha, `MetadataTexture`=uncertainty
+
+所有读取都是传入当前帧 `PixelPos`——历史已在 DecimateHistory 中重投影对齐，无需再做坐标变换。
+
+### 4.9 ComputeSpatialAntiAliaserLumaLDR：生成 LDR 亮度
+
+```hlsl
+tsr_half ComputeSpatialAntiAliaserLumaLDR(SceneColor)
+{
+    PixelLuma = dot(SceneColor[i].rgb, (0.299, 0.587, 0.114));  // 亮度
+    AALumaLDR[i] = PixelLuma / (0.5 + PixelLuma);                // HDR→LDR 压缩
+}
+```
+
+写入 `InputSceneColorLdrLumaOutput`，供后续 `SpatialAntiAliasing` pass 做边缘检测。
+
+### 4.10 Mutual Annihilation：双向互钳
+
+将当前帧和历史帧的颜色互相钳位到对方的 3×3 邻域范围，消除单向偏差：
+
+```hlsl
+// 第一步：当前帧 3×3 min/max
+MinMax3x3(ExposedInput, out InputMin, out InputMax);
+
+// 第二步：历史被钳到当前帧的 3×3 邻域盒
+ClampedHistory_initial = clamp(ExposedHistory, InputMin, InputMax);
+
+// 第三步：当前帧被钳到"已被钳的历史"的 3×3 邻域盒
+ClampedInput = Clamp3x3(ExposedInput, ClampedHistory_initial);
+
+// 第四步：对称操作——历史被钳到"已被钳的当前帧"的 3×3 邻域盒
+ClampedHistory = AnnihilateToGuide3x3(ExposedHistory, ExposedInput);
+//              = Clamp3x3(History, Clamp3x3(Input, History))
+```
+
+核心函数：
+
+| 函数 | 作用 |
+|------|------|
+| `MinMax3x3` | 可分离 1×3 水平 + 3×1 垂直 → 3×3 邻域各通道 AABB（轴对齐包围盒） |
+| `Clamp3x3(ToClamp, BoundaryCenter)` | 以 BoundaryCenter 的 3×3 邻域 min/max 钳位 ToClamp |
+| `AnnihilateToGuide3x3(ToClamp, Guide)` | 双层对称钳位，消除单向偏差 |
+
+**MinMax3x3 原理**：可分离 min/max 滤波——先水平 1×3 取每列 min/max，再垂直 3×1 取全局 min/max。逐通道独立计算，输出的 min/max 向量可能来自不同邻居像素。
+
+**邻近像素访问**：水平方向用 wave broadcast（Xor=1），垂直方向若跨 wave 则用 LDS 交换。每个 element 独立算自己的 3×3 邻域，tensor 的 lane 交错存储保证了正确空间对应。
+
+### 4.11 MeasureRejection：时序一致性判定（核心算法）
+
+```hlsl
+MeasureRejection(
+    InputC0,            // 当前帧原始色（未互钳）
+    ClampedInput,       // 当前帧互钳色
+    ClampedHistory,     // 历史帧互钳色
+    MoireError,
+    out RejectionBlendFinal,  // 1.0=信历史, 0.0=信当前
+    out RejectionClampBlend); // clamp 力度
+```
+
+#### 算法 8 步
+
+**① 模糊历史**：
+```hlsl
+FilteredHistory = Blur3x3(HistoryC2);
+```
+
+**② 计算 TotalVariation（区域不稳定性）**：
+```hlsl
+TotalVarInputDiffC0C2 = abs(TotalVariation3x3(|InputC0 - InputC2|));  // 互钳改变量
+TotalVarInputC2 = abs(TotalVariation3x3(InputC2));                    // 空间复杂度
+```
+
+**③ 计算 ClampError（容差带）**：
+```hlsl
+ClampError = LDR量化误差;
+ClampError = max(ClampError, Blur3x3(min(TotalVarInputDiffC0C2, TotalVarInputC2)));
+ClampError = max(ClampError, InputC2BoxSize * FilteringWeight * 0.25);
+ClampError = ClampError + LDR量化误差;
+// 结果：局部越复杂、变化越大 → 容差越宽
+```
+
+**④ 构建钳位盒**：
+```hlsl
+FilteredInput = Blur3x3(InputC2);
+MinMax3x3(FilteredInput, out BoxMin, out BoxMax);
+BoxMin -= ClampError; BoxMax += ClampError;  // 安全盒
+```
+
+**⑤ 钳位历史到安全盒**：
+```hlsl
+ClampedFilteredHistory = clamp(FilteredHistory, BoxMin, BoxMax);
+```
+
+**⑥（可选）摩尔纹修正**：用 `MoireError` 进一步扩展钳位盒。
+
+**⑦ 计算 Rejection**：
+```hlsl
+BoxSize = InputC2BoxSize * FilteringWeight + LDR量化误差 * 2 * FilteringWeight;
+Delta = max(|FilteredInput - FilteredHistory|, BoxSize);
+
+RawClampedEnergy = |ClampedFilteredHistory - FilteredHistory|;  // 历史被钳了多少
+RawRejection = min_over_channels( saturate(1.0 - RawClampedEnergy / Delta) );
+```
+
+| RawClampedEnergy | RawRejection | 含义 |
+|---|---|---|
+| ≈ 0（不需要钳） | **1.0** | 历史和当前一致 → 信历史 |
+| 很大（需要大力钳） | **0.0** | 历史越界严重 → 信当前 |
+
+**⑧ 空间平滑**：
+```hlsl
+OutRejectionClampBlend = MaxRGBMinA3x3(Median3x3(RawRejection));
+FilteredClampedEnergy = MaxRGBMinA3x3(Median3x3(RawClampedEnergy));
+FilteredRejection = min_over_channels( saturate(1.0 - FilteredClampedEnergy / Delta) );
+OutRejectionBlendFinal = FilteredRejection;
+```
+
+Median3x3 中值滤波去噪，MaxRGB 取保守值。核心思想：**钳得越多 → 历史越不可信 → 多用当前帧**。
+
+### 4.12 UpdateGuide：生成下一帧 Guide 颜色
+
+```hlsl
+FinalGuide = lerp(ExposedHistory, ExposedInput, BlendFinal);
+```
+
+其中 `BlendFinal` 由 `RejectionBlendFinal` 推导：
+
+```hlsl
+BlendFinal = max(
+    TheoricBlendFactor,                  // 理论最小 blend（保证历史至少占一点权重）
+    1.0 - RejectionBlendFinal,           // rejection 越高 → blend 越低 → 越多历史
+    select(bIsDisoccluded, 1.0, ...));   // disocclusion → 全信当前
+```
+
+管线：`Input → AddPerceptionAdd / History → GCSToLinear → UpdateGuide → LinearToGCS → RemovePerceptionAdd → FinalGuide → HistoryGuideOutput`
+
+### 4.13 随机抖动量化
+
+```hlsl
+uint2 Random = Rand3DPCG16(int3(LaneSimdPixelOffset, View.StateFrameIndexMod8)).xy;
+tsr_half E = Hammersley16(0, 1, Random).x;
+FinalGuideColor.rgb = QuantizeForUNormRenderTarget(FinalGuideColor.rgb, E, HistoryGuideQuantizationError);
+```
+
+和 DecimateHistory 同样机制——将量化误差转为每帧不同的高频噪声，TAA 累积后收敛。
+
+### 4.14 输出纹理汇总
+
+| 输出 | 内容 | 使用者 |
+|------|------|--------|
+| `HistoryGuideOutput` | 下一帧用的 Guide 颜色 + uncertainty | DecimateHistory |
+| `HistoryRejectionOutput` | 每个像素的 Rejection 值 | UpdateHistory |
+| `InputSceneColorOutput` | 合成的完整当前帧颜色（不透明+半透明） | UpdateHistory |
+| `InputSceneColorLdrLumaOutput` | LDR 亮度 | SpatialAntiAliasing |
+| `ReprojectionFieldOutput` | 若有 resurrection，覆盖 MV 和 Jacobian | UpdateHistory |
+| `AntiAliasMaskOutput` | 空间反走样遮罩 | SpatialAntiAliasing |
+
+### 4.15 关键设计点总结
+
+| 概念 | 说明 |
+|------|------|
+| **张量化计算** | `tsr_tensor` 打包 4 像素并行处理，卷积网络减少指令 fetch |
+| **Lane/LDS 双重邻居访问** | 水平邻域用 wave broadcast（无延迟），跨 wave 垂直邻域用 LDS |
+| **互钳消除偏差** | 当前和历史双向钳位，任何只在一帧出现的颜色被"湮灭" |
+| **容差随复杂度自适应** | 局部颜色变化大 → ClampError 大 → 更宽容，避免误判 |
+| **Guide 低清存储** | 仅用于时序判定，低清精度足够，省带宽 |
+| **两次合成分离** | 输出用精确合成，rejection 用模糊合成——判定保守但输出精确 |
