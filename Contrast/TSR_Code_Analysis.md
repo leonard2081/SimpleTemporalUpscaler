@@ -1309,11 +1309,70 @@ HDR 感知的加权混合，双方各有独立 tone weight。
 
 若 `HistorySize > OutputRect.Size()` → 额外降采样到输出分辨率。否则直接输出。
 
-若 `HistorySize > OutputRect.Size()` → 额外降采样到输出分辨率。否则直接输出。
+---
+
+## 7. Pass: ResolveHistory
+
+**源文件**: `Engine/Shaders/Private/TemporalSuperResolution/TSRResolveHistory.usf`
+**C++ 调度**: `TemporalSuperResolution.cpp:2700`
+
+### 7.1 概述
+
+纯空域降采样 pass，仅在 `HistorySize > OutputRect.Size()` 时运行（如 `r.TSR.History.ScreenPercentage=200`）。将高清历史缓冲区降采样到输出分辨率，不涉及任何时序数据。
+
+### 7.2 线程模型与分辨率
+
+线程派送覆盖输出分辨率：
+
+```hlsl
+[numthreads(LANE_COUNT, 1, 1)]  // wave 大小，如 16/32
+```
+
+### 7.3 核心算法：Mitchell-Netravali 三次卷积降采样
+
+不是简单邻域平均，而是 4×4 邻域 Mitchell-Netravali 滤波：
+
+```
+每个输出像素对应 4×4 个高清历史像素，分 4 个象限:
+
+    c  b | b  c
+    b  a | a  b
+    ──── o ────     o = 输出像素中心
+    b  a | a  b
+    c  b | b  c
+```
+
+Mitchell-Netravali 权重（三次样条曲线，平衡锐度和平滑）：
+
+```hlsl
+WeightA = MitchellNetravali(0.5, B, C);  // 距离 0.5 像素
+WeightB = MitchellNetravali(1.5, B, C);  // 距离 1.5 像素
+// 归一化后得 FinalWeightA, FinalWeightB, FinalWeightC
+```
+
+4 个象限各自加权点积，再用 wave broadcast 合并：
+
+```hlsl
+Out0 = DownsampleDot2x2(LDRColors, {C, B, B, A});  // 左上
+Out1 = DownsampleDot2x2(LDRColors, {B, C, A, B});  // 右上
+Out2 = DownsampleDot2x2(LDRColors, {B, A, C, B});  // 左下
+Out3 = DownsampleDot2x2(LDRColors, {A, B, B, C});  // 右下
+
+Output = Out0 + WaveBroadcast(Out1, X+1) + WaveBroadcast(Out2, Y+1) + WaveBroadcast(Out3, XY+1);
+```
+
+### 7.4 附加处理
+
+- **HDR Tone Weight**：采样前用 `HdrWeight4(color)` 对亮部加权，结果用 `HdrWeightInvY(luma)` 恢复——防止 bright spot 在降采样中消失
+- **Min/Max Clamp**：对 2×2 块取 min/max 后再对邻居做 2×2 扩展，clip 最终结果防止 ghosting/overshoot
+
+### 7.5 输出
+
+`SceneColorOutputTexture`——直接输出到屏幕或后续后处理。
 
 ---
 
-## 7. TSR 整体数据流总览
+## 8. TSR 整体数据流总览
 
 ```
 Pass                       输出纹理                     后续使用者 (R=只读, W=只写, RW=读写)
@@ -1361,10 +1420,15 @@ SpatialAntiAliasing        AntiAliasingOutput             ← SpatialAntiAliasin
 
 
 UpdateHistory              History.ColorArray             ← UpdateHistory (W) → 下帧 UpdateHistory.PrevHistoryColorTex (R)
-                            (也作为当前帧画面输出)        → 屏幕 / 后续后处理
-                           History.MetadataArray          ← UpdateHistory (W) → 下帧 UpdateHistory.PrevHistoryMetadataTx(R)
+                             (也作为当前帧画面输出)        → ResolveHistory.UpdateHistoryOutputTex       (R) [HistorySize>OutputRect时]
+                            History.MetadataArray          ← UpdateHistory (W) → 下帧 UpdateHistory.PrevHistoryMetadataTx(R)
 
-(ResolveHistory)           (HistorySize > OutputRect 时降采样输出)
+
+ResolveHistory             SceneColorOutputTexture        ← ResolveHistory (W)
+                            (仅 HistorySize > OutputRect 时运行)  → 屏幕 / 后续后处理
+                            输入: UpdateHistory.ColorArray SRV  (R)
+                            算法: Mitchell-Netravali 4×4 降采样
+                            分辨率: OutputRect (输出分辨率)
 ```
 
 ### 跨帧数据流转
