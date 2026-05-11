@@ -13,6 +13,13 @@
 
 该 pass 初始化一个名为 `TSR.PrevAtomics` 的 `RWTexture2DArray<uint>` (PF_R32_UINT)，将所有元素清零。该纹理随后在 `DilateVelocity` pass 中用作原子累加器（InterlockedMax），存储"最近遮挡物深度"。
 
+### 1.1.1 输入/输出摘要
+
+| 方向 | 纹理 | 关键信息 |
+|------|------|----------|
+| **输入** | (无纹理，仅常量参数) | `InputInfo_ViewportMin/Max`——视口范围 |
+| **输出** | `TSR.PrevAtomics` (PF_R32_UINT, 2DArray) | 所有元素置零，后续用作 `InterlockedMax` 原子累加器 |
+
 ### 1.2 清理的纹理
 
 | 属性 | 值 |
@@ -112,6 +119,22 @@ DilateVelocity 是 TSR 最核心的 pass 之一，负责：
 3. 计算膨胀后的运动矢量
 4. 计算重投影边界（Reprojection Boundary）
 5. 输出多种元数据纹理给后续 pass 使用
+
+### 2.1.1 输入/输出摘要
+
+| 方向 | 纹理 | 关键信息 |
+|------|------|----------|
+| **输入** | `SceneDepthTexture` (外部) | 3×3 邻域深度，用于膨胀和边缘检测 |
+| | `SceneVelocityTexture` (外部) | 3×3 邻域 MV，用于膨胀速度计算 |
+| | `PrevAtomicOutput` (← ClearPrevTextures) | 原子清零纹理，Scatter 写入最近遮挡物深度+补洞速度 |
+| **输出** | `ClosestDepthOutput` | `.r`: 上一帧最近深度, `.g`: 当前最近（膨胀后）深度 |
+| | `R8Output` slice[0] | DilateMask: ReprojectionEdge(7bit) + HasReprojectionOffset(1bit) |
+| | `R8Output` slice[1] | DeviceZError: 深度误差容差 (0~255) |
+| | `R8Output` slice[2] | IsMovingMask: 闪烁检测标志 (仅 Flickering 开启) |
+| | `ReprojectionFieldOutput` slice[0] | 膨胀后的 MV |
+| | `ReprojectionFieldOutput` slice[1] | 2×2 Jacobian 矩阵 (仅 bReprojectionField) |
+| | `ReprojectionFieldOutput` slice[2] | 深度边缘亚像素边界 (仅 bReprojectionField) |
+| | `PrevAtomicOutput` (Scatter) | 散射写入: f16(深度)+补洞 velocity |
 
 ### 2.2 坐标映射：Z 序曲线 vs 线性映射
 
@@ -414,6 +437,20 @@ DecimateHistory 是 TSR 重投影的核心 pass，负责：
 3. 通过深度比对判断 disocclusion
 4. 在 disocclusion 区域尝试补洞（hole-filling）
 5. 输出重投影后的历史颜色、降采样 MV、像素状态标志位
+
+### 3.1.1 输入/输出摘要
+
+| 方向 | 纹理 | 关键信息 |
+|------|------|----------|
+| **输入** | `DilatedReprojectionVecTex` (← Dilate) | 膨胀后的 MV，用于重投影和边缘检测 |
+| | `DilateMaskTexture` (← Dilate) | ReprojectionEdge + HasReprojectionOffset |
+| | `DepthErrorTexture` (← Dilate) | 深度误差容差 |
+| | `ClosestDepthTexture` (← Dilate) | `.r`: 上一帧最近深度, `.g`: 当前最近深度 |
+| | `PrevAtomicTextureArray` (← Dilate) | 散射的最近深度 + hole-filling velocity |
+| | `PrevHistoryGuide` (← 上帧 Reject) | 历史帧低清引导颜色 |
+| **输出** | `ReprojectedHistoryGuideOutput` | 重投影后的历史 Guide 颜色 + uncertainty (+ 复活色) |
+| | `DecimateMaskOutput` | `.r`: DecimateBitMask (像素状态标志), `.g`: ReprojectionEdge |
+| | `ReprojectionFieldOutput` | 降采样/补洞后的 MV + Jacobian (覆盖写入) |
 
 ### 3.2 输入纹理
 
@@ -768,6 +805,22 @@ RejectShading 是 TSR 时序稳定性决策的最终关口，负责：
 3. 计算当前帧与历史帧的混合比例（RejectionBlendFinal）
 4. 生成下一帧使用的 Guide 颜色
 
+### 4.1.1 输入/输出摘要
+
+| 方向 | 纹理 | 关键信息 |
+|------|------|----------|
+| **输入** | `InputTexture` (外部 SceneColor) | 当前帧低清不透明颜色 |
+| | `InputSceneTranslucencyTexture` (外部) | DOF 后的分离半透明 |
+| | `ReprojectedHistoryGuideTex` (← Decimate) | 重投影后的历史 Guide 色 + uncertainty (+ 复活色) |
+| | `DecimateMaskTexture` (← Decimate) | BitMask (off-screen/disocclusion/PA/补洞/复活) + ReprojectionEdge |
+| | `IsMovingMaskTexture` (← Dilate) | 闪烁检测标志 |
+| | `ClosestDepthTexture` (← Dilate) | 最近深度 (g 通道) |
+| **输出** | `History.GuideArray` | 下一帧的低清 Guide 颜色 (混合当前+历史) |
+| | `HistoryRejectionOutput` | `.r`: LowFrequencyRejection, `.g`: DisableHistoryClamp, `.b`: DecreaseValidity, `.a`: bitmask (disocclusion/resurrection) |
+| | `InputSceneColorOutput` | 合成完整当前帧颜色 (不透明+半透明) |
+| | `InputSceneColorLdrLumaOutput` | LDR 亮度 (供空域反走样边缘检测) |
+| | `AntiAliasMaskOutput` | 需要反走样的像素标记 |
+
 ### 4.2 线程模型：Lane + SIMD + Tensor
 
 ```hlsl
@@ -1073,6 +1126,14 @@ History = select(bResurrectHistory, ResurrectedHistory, History);
 
 TSR 的时序抗锯齿在 disocclusion、高速运动、CameraCut 场景下失效。SpatialAntiAliasing 在这些区域做**空域边缘定向反走样兜底**——检测 LDR 亮度中的锯齿边缘，算出亚像素采样偏移，供 UpdateHistory 调整对当前帧低清颜色的采样位置。
 
+### 5.1.1 输入/输出摘要
+
+| 方向 | 纹理 | 关键信息 |
+|------|------|----------|
+| **输入** | `AntiAliasMaskTexture` (← Reject) | 需要反走样的像素标记 |
+| | `InputSceneColorLdrLumaTexture` (← Reject) | LDR 亮度，用于边缘检测 |
+| **输出** | `AntiAliasingOutput` | 亚像素采样偏移 ∈ [-1,1]² (编码存储) |
+
 ### 5.2 输入
 
 | 纹理 | 来源 | 内容 |
@@ -1136,6 +1197,21 @@ UpdateHistory 是 TSR 的最终输出 pass，负责：
 2. 对当前低清帧做多采样点空间滤波（上采样核）
 3. 根据 rejection 数据加权混合历史与当前帧
 4. 输出最终高清画面，同时存入 `History.ColorArray` 作为下一帧的历史
+
+### 6.1.1 输入/输出摘要
+
+| 方向 | 纹理 | 关键信息 |
+|------|------|----------|
+| **输入** | `PrevHistoryColorTex` (← 上帧 Update) | 高清历史颜色 (多帧 Texture2DArray) |
+| | `PrevHistoryMetadataTex` (← 上帧 Update) | 高清历史元数据 |
+| | `HistoryRejectionTex` (← Reject) | `.r`: LowFrequencyRejection, `.g`: DisableHistoryClamp, `.b`: DecreaseValidity, `.a`: bitmask |
+| | `InputSceneColorTex` (← Reject) | 合成完整当前帧颜色 (低清) |
+| | `ReprojectionVectorTex` (← Dec/Dilate) | MV (可能已被补洞 MV 替换) |
+| | `ReprojectionJacobianTex` (← Dil/Dec) | 2×2 Jacobian 矩阵 |
+| | `ReprojectionBoundaryTex` (← Dilate) | 深度边缘亚像素边界 |
+| | `AntiAliasingTex` (← SpatialAA) | 空间反走样亚像素采样偏移 |
+| **输出** | `History.ColorArray` | 高清历史颜色 (当前帧画面 + 下帧历史) |
+| | `History.MetadataArray` | 高清历史元数据 |
 
 ### 6.2 线程模型：高清 + 双像素向量化
 
@@ -1319,6 +1395,13 @@ HDR 感知的加权混合，双方各有独立 tone weight。
 ### 7.1 概述
 
 纯空域降采样 pass，仅在 `HistorySize > OutputRect.Size()` 时运行（如 `r.TSR.History.ScreenPercentage=200`）。将高清历史缓冲区降采样到输出分辨率，不涉及任何时序数据。
+
+### 7.1.1 输入/输出摘要
+
+| 方向 | 纹理 | 关键信息 |
+|------|------|----------|
+| **输入** | `UpdateHistoryOutputTex` (← Update) | 高清历史颜色 (SRV) |
+| **输出** | `SceneColorOutputTexture` | 降采样后的输出分辨率画面 |
 
 ### 7.2 线程模型与分辨率
 
