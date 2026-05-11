@@ -1375,60 +1375,68 @@ Output = Out0 + WaveBroadcast(Out1, X+1) + WaveBroadcast(Out2, Y+1) + WaveBroadc
 ## 8. TSR 整体数据流总览
 
 ```
-Pass                       输出纹理                     后续使用者 (R=只读, W=只写, RW=读写)
-─────────────────────────────────────────────────────────────────────────────────────────────────
-ClearPrevTextures          TSR.PrevAtomics             → DilateVelocity.PrevAtomicOutput        (RW InterlockedMax)
-                                                       → DecimateHistory.PrevAtomicTextureArray  (R)
+Pass               输入纹理 (R=只读)                    输出纹理 (W=只写)              去向 (R=只读, W=只写, RW=读写)
+──────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ClearPrevTextures  (无，仅常量参数)                     TSR.PrevAtomics              → DilateVelocity         (RW InterlockedMax)
+                                                                                    → DecimateHistory        (R)
 
 
-DilateVelocity             ClosestDepthOutput           → DecimateHistory.ClosestDepthTexture    (R)
-                                                       → RejectShading.ClosestDepthTexture       (R)
+DilateVelocity     SceneDepthTexture (R)                ClosestDepthOutput           → DecimateHistory        (R)
+                   SceneVelocityTexture (R)                                           → RejectShading         (R)
+                   TSR.PrevAtomics (RW)
 
-                           R8Output
-                             slice[0]: DilateMask       → DecimateHistory.DilateMaskTexture      (R)
-                             slice[1]: DeviceZError     → DecimateHistory.DepthErrorTexture      (R)
-                             slice[2]: IsMovingMask     → RejectShading.IsMovingMaskTexture      (R)
+                                                       R8Output
+                                                         slice[0]: DilateMask       → DecimateHistory        (R)
+                                                         slice[1]: DeviceZError     → DecimateHistory        (R)
+                                                         slice[2]: IsMovingMask     → RejectShading         (R)
 
-                           ReprojectionFieldOutput
-                             slice[0]: 膨胀 MV          → DecimateHistory.DilatedReprojectionVecTex (R)
-                                                        → UpdateHistory.ReprojectionVectorTex     (R)
-                             slice[1]: Jacobian         → UpdateHistory.ReprojectionJacobianTex   (R)
-                             slice[2]: 边界              → UpdateHistory.ReprojectionBoundaryTex    (R)
-                             slice[3]: 降采样 MV          ← DecimateHistory  (W) → UpdateHistory (R)
+                                                       ReprojectionFieldOutput
+                                                         slice[0]: 膨胀 MV          → DecimateHistory        (R)
+                                                                                    → UpdateHistory          (R)
+                                                         slice[1]: Jacobian         → UpdateHistory          (R)
+                                                         slice[2]: 边界              → UpdateHistory          (R)
 
-
-DecimateHistory            ReprojectedHistoryGuideOutput → RejectShading.ReprojectedHistoryGuideTex (R)
-                             slice[0]: GuideColor                                       (复活 slice: R)
-                             slice[1]: Uncertainty
-
-                           DecimateMaskOutput (.r=BitMask, .g=Edge)
-                                                       → RejectShading.DecimateMaskTexture       (R)
-
-                           ReprojectionFieldOutput       ← DecimateHistory (W, slice[0]或[3])
-                             (降采样 MV, 补洞 MV 替换)   → UpdateHistory.ReprojectionVectorTex     (R)
-                             (Jacobian 清零)             → UpdateHistory.ReprojectionJacobianTex   (R)
+                                                       PrevAtomicOutput             → DecimateHistory        (R)
 
 
-RejectShading              History.GuideArray            ← RejectShading (W) → 下帧 DecimateHistory.PrevHistoryGuide    (R)
-                           HistoryRejectionOutput         ← RejectShading (W) → UpdateHistory.HistoryRejectionTex        (R)
-                           InputSceneColorOutput          ← RejectShading (W) → UpdateHistory.InputSceneColorTex          (R)
-                           InputSceneColorLdrLumaOutput   ← RejectShading (W) → SpatialAntiAliasing.InputLdrLumaTex       (R)
-                           AntiAliasMaskOutput            ← RejectShading (W) → SpatialAntiAliasing.AntiAliasMaskTex      (R)
+DecimateHistory    DilatedReprojectionVecTex (R)        ReprojectedHistoryGuideOutput → RejectShading         (R)
+                   DilateMaskTexture (R)                  slice[0]: GuideColor
+                   DepthErrorTexture (R)                  slice[1]: Uncertainty
+                   ClosestDepthTexture (R)                (slice[2/3]: 复活 Guide   → RejectShading         (R))
+                   PrevAtomicTextureArray (R)
+                   PrevHistoryGuide (R)                 DecimateMaskOutput            → RejectShading         (R)
+                                                         (.r=BitMask, .g=Edge)
+                                                       ReprojectionFieldOutput
+                                                         ReprojVecIdx 切片: MV       → UpdateHistory          (R)
+                                                           (补洞 MV 替换)
+                                                         slice[1]: Jacobian 清零      → UpdateHistory          (R)
 
 
-SpatialAntiAliasing        AntiAliasingOutput             ← SpatialAntiAliasing (W) → UpdateHistory.AntiAliasingTex     (R)
+RejectShading      InputTexture (R)                     History.GuideArray            → 下帧 DecimateHistory   (R)
+                   InputSceneTranslucencyTexture (R)    HistoryRejectionOutput         → UpdateHistory          (R)
+                   ReprojectedHistoryGuideTexture (R)   InputSceneColorOutput          → UpdateHistory          (R)
+                   DecimateMaskTexture (R)              InputSceneColorLdrLumaOutput   → SpatialAntiAliasing    (R)
+                   IsMovingMaskTexture (R)              AntiAliasMaskOutput            → SpatialAntiAliasing    (R)
+                   ClosestDepthTexture (R)
+                   (ResurrectedHistoryGuideTexture) (R)
 
 
-UpdateHistory              History.ColorArray             ← UpdateHistory (W) → 下帧 UpdateHistory.PrevHistoryColorTex (R)
-                             (也作为当前帧画面输出)        → ResolveHistory.UpdateHistoryOutputTex       (R) [HistorySize>OutputRect时]
-                            History.MetadataArray          ← UpdateHistory (W) → 下帧 UpdateHistory.PrevHistoryMetadataTx(R)
+SpatialAntiAliasing  AntiAliasMaskTexture (R)           AntiAliasingOutput             → UpdateHistory          (R)
+                     InputSceneColorLdrLumaTexture (R)
 
 
-ResolveHistory             SceneColorOutputTexture        ← ResolveHistory (W)
-                            (仅 HistorySize > OutputRect 时运行)  → 屏幕 / 后续后处理
-                            输入: UpdateHistory.ColorArray SRV  (R)
-                            算法: Mitchell-Netravali 4×4 降采样
-                            分辨率: OutputRect (输出分辨率)
+UpdateHistory      PrevHistoryColorTexture (R)           History.ColorArray             → 下帧 UpdateHistory    (R)
+                   PrevHistoryMetadataTexture (R)         (也作为当前帧画面输出)        → ResolveHistory        (R)
+                   HistoryRejectionTexture (R)                                           → 屏幕 / 后续后处理
+                   InputSceneColorTexture (R)            History.MetadataArray          → 下帧 UpdateHistory    (R)
+                   ReprojectionVectorTexture (R)
+                   ReprojectionJacobianTexture (R)
+                   ReprojectionBoundaryTexture (R)
+                   AntiAliasingTexture (R)
+
+
+ResolveHistory     UpdateHistoryOutputTexture (R)        SceneColorOutputTexture        → 屏幕 / 后续后处理
+                   (仅 HistorySize > OutputRect 时运行, Mitchell-Netravali 4×4 降采样)
 ```
 
 ### 跨帧数据流转
@@ -1439,6 +1447,6 @@ ResolveHistory             SceneColorOutputTexture        ← ResolveHistory (W)
   UpdateHistory  → History.ColorArray  → QueueExtract → 下帧 InputHistory.ColorArray
 
 帧 N+1:
-  DecimateHistory ← InputHistory.GuideArray   (PrevHistoryGuide, 低清, 重投影采 reference)
+  DecimateHistory ← InputHistory.GuideArray   (PrevHistoryGuide, 低清, 重投影参考)
   UpdateHistory   ← InputHistory.ColorArray   (PrevHistoryColorTexture, 高清, Catmull-Rom 采样)
 ```
