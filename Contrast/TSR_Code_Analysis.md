@@ -714,6 +714,45 @@ PrevHistoryGuide (上帧 RejectShading 存下的，低清)
 Guide 只负责时序判定和亮度引导，始终运行在低清分辨率下。
 ```
 
+### 3.13 历史帧复活（Resurrection）— DecimateHistory 阶段
+
+#### C++ 侧：滚动帧管理与 ClipToResurrectionClip
+
+`FTSRHistorySliceSequence`（`TemporalSuperResolution.cpp:1204`）管理多帧滚动缓冲区：
+
+```cpp
+struct FTSRHistorySliceSequence
+{
+    int32 FrameStorageCount;   // 槽位数（≥ 4，偶数）
+    int32 FrameStoragePeriod;  // 持久帧存储间隔（奇数）
+    int32 GetResurrectionFrameRollingIndex(AccumulatedFrameCount, LastFrameRollingIndex);
+};
+```
+
+复活帧选择：环形缓冲中最老的持久帧 → `ceil((Last+Period)/Period)*Period % Total`。`FTSRHistory` 存储每帧的 `ViewMatrices` 用于重投影计算。
+
+C++ 侧从复活帧的 `ViewMatrices` 构造 `ClipToResurrectionClip`：
+
+```cpp
+const FViewMatrices& PrevMatrices = InputHistory.ViewMatrices[ResurrectionFrameSliceIndex];
+FVector DeltaTranslation = PrevPreViewTranslation - CurrentPreViewTranslation;
+FMatrix InvViewProj = CurrentInvProjection * CurrentView.Transpose();
+FMatrix PrevViewProj = DeltaTranslation * PrevView * PrevProjection;
+ClipToResurrectionClip = InvViewProj * PrevViewProj;
+// 包含完整相机平移，支持相机全自由度运动
+```
+
+#### Shader 侧：计算复活位置
+
+```hlsl
+// TSRDecimateHistory.usf:206-208
+float4 ResurrectionClip = mul(ThisClip, ClipToResurrectionClip);
+float2 ResurrectionScreen = ResurrectionClip.xy / ResurrectionClip.w;
+// → 越界检测 → bIsResurrectionOffScreen
+// → 采样复活帧 Guide 颜色 → 写入 ReprojectedHistoryGuideOutput 额外 slice
+// → bIsResurrectionOffScreen → DecimateMaskOutput bit 4
+```
+
 ---
 
 ## 4. Pass: RejectShading
@@ -991,7 +1030,28 @@ FinalGuideColor.rgb = QuantizeForUNormRenderTarget(FinalGuideColor.rgb, E, Histo
 | `ReprojectionFieldOutput` | 若有 resurrection，覆盖 MV 和 Jacobian | UpdateHistory |
 | `AntiAliasMaskOutput` | 空间反走样遮罩 | SpatialAntiAliasing |
 
-### 4.15 关键设计点总结
+### 4.15 历史帧复活（Resurrection）— RejectShading 阶段
+
+每像素比较普通历史（N-1 帧）和复活历史（N-K 帧）谁更接近当前帧：
+
+```hlsl
+PrevMatch         = |当前帧 - 普通历史|;
+ResurrectionMatch = |当前帧 - 复活历史|;
+
+bResurrectionIsCloser = (Sum3x3(PrevMatch - ResurrectionMatch) > 阈值)
+                     && !bIsResurrectionOffScreen;
+
+// 对复活历史独立跑 MeasureRejection
+MeasureRejection(Input, ClampedResurrectedInput, ClampedResurrectedHistory, ...);
+bResurrectHistory = ShouldResurrectHistory(RejectionBlendFinal, ResurrectionRejectionBlendFinal, bIsCloser);
+
+// 胜出者替换历史
+History = select(bResurrectHistory, ResurrectedHistory, History);
+```
+
+**每帧都跑，不是仅 CameraCut**——正常帧时普通历史颜色更接近自动胜出，CameraCut 时复活帧胜出。结果编码到 `HistoryRejection` bit 1，UpdateHistory 据此切换 `FrameIndex`。
+
+### 4.16 关键设计点总结
 
 | 概念 | 说明 |
 |------|------|
@@ -1001,3 +1061,322 @@ FinalGuideColor.rgb = QuantizeForUNormRenderTarget(FinalGuideColor.rgb, E, Histo
 | **容差随复杂度自适应** | 局部颜色变化大 → ClampError 大 → 更宽容，避免误判 |
 | **Guide 低清存储** | 仅用于时序判定，低清精度足够，省带宽 |
 | **两次合成分离** | 输出用精确合成，rejection 用模糊合成——判定保守但输出精确 |
+
+---
+
+## 5. Pass: SpatialAntiAliasing
+
+**源文件**: `Engine/Shaders/Private/TemporalSuperResolution/TSRSpatialAntiAliasing.usf`
+**C++ 调度**: `TemporalSuperResolution.cpp:2423`
+
+### 5.1 概述
+
+TSR 的时序抗锯齿在 disocclusion、高速运动、CameraCut 场景下失效。SpatialAntiAliasing 在这些区域做**空域边缘定向反走样兜底**——检测 LDR 亮度中的锯齿边缘，算出亚像素采样偏移，供 UpdateHistory 调整对当前帧低清颜色的采样位置。
+
+### 5.2 输入
+
+| 纹理 | 来源 | 内容 |
+|------|------|------|
+| `AntiAliasMaskTexture` | RejectShading 输出 | 标记需要反走样的像素 |
+| `InputSceneColorLdrLumaTexture` | RejectShading 输出 | LDR 亮度（用于边缘检测） |
+
+分辨率：低清（`GetGroupCount(InputRect.Size(), 8)`）。
+
+### 5.3 算法
+
+和 DilateVelocity 的 ComputeReprojectionBoundary 相同的三件套，输入从深度图换成 LDR 亮度图：
+
+```hlsl
+// ① 读取 3×3 LDR 亮度邻域
+InputC, InputN, InputS, InputE, InputW, InputNE, InputNW, InputSE, InputSW;
+
+// ② 找边缘方向
+FindBrowsingDirection(InputC, N, S, E, W, NE, NW, SE, SW,
+    out NoiseFiltering, out BrowseDirection, out EdgeSide, out EdgeLuma);
+
+// ③ 沿边缘扫描
+BrowseNeighborhoodBilinearOptimized(InputSceneColorLdrLumaTexture, InputC, EdgeLuma, ...);
+
+// ④ 算亚像素偏移
+ComputeReprojectionBoundary(BrowseDirection, EdgeLengthP, EdgeLengthN, ...);
+// → AntiAliasingOutput[Pixel] = EncodedOffset ∈ [-1,1]²
+```
+
+### 5.4 UpdateHistory 中的使用
+
+同一低清像素的偏移被多个高清输出像素共享，但效果不同——因为偏移的是 `InputPPCo`（浮点坐标）：
+
+```hlsl
+// 读取偏移
+SpatialAntiAliasingOffset = DecodeSpatialAntiAliasingOffset(AntiAliasingTexture[...]);
+
+// 仅在无历史时全量应用
+SpatialAntiAliasingLerp = select(bIsOffScreen || bIsDisoccluded, 1.0, saturate(1.0 - Rejection * 4.0));
+
+// 偏移 InputPPCo（浮点！）
+InputPPCo += SpatialAntiAliasingOffset * SpatialAntiAliasingLerp;
+
+// 重新计算最近整数像素
+InputPPCk = floor(InputPPCo) + 0.5;
+```
+
+同一偏移作用于不同子像素位置时，有的跨越整数边界（改变了实际采样点），有的不变——自然产生差异化效果。
+
+---
+
+## 6. Pass: UpdateHistory
+
+**源文件**: `Engine/Shaders/Private/TemporalSuperResolution/TSRUpdateHistory.usf`
+**C++ 调度**: `TemporalSuperResolution.cpp:2613`
+
+### 6.1 概述
+
+UpdateHistory 是 TSR 的最终输出 pass，负责：
+1. 用重投影 MV 采样高清历史帧颜色（Catmull-Rom 双三次滤波）
+2. 对当前低清帧做多采样点空间滤波（上采样核）
+3. 根据 rejection 数据加权混合历史与当前帧
+4. 输出最终高清画面，同时存入 `History.ColorArray` 作为下一帧的历史
+
+### 6.2 线程模型：高清 + 双像素向量化
+
+```cpp
+FComputeShaderUtils::GetGroupCount(HistorySize, 8);  // HistorySize = 输出分辨率
+```
+
+```hlsl
+// DPV 模式（双像素向量化，FP16 硬件）
+[numthreads(32, 1, 1)]  // TILE_SIZE * TILE_SIZE / 2 = 32 threads
+// 1 thread = 2 个 history 像素
+
+// 普通模式
+[numthreads(64, 1, 1)]  // TILE_SIZE * TILE_SIZE = 64 threads
+// 1 thread = 1 个 history 像素
+```
+
+DPV 模式下坐标用 `tsr_short2x2 HistoryPixelPos` 存 2 个像素，后续计算用 `dpv_*` 宏并行处理两个像素。
+
+### 6.3 InputPPCo：输出像素映射到低清输入
+
+```hlsl
+ScreenPos = ApplyScreenTransform(HistoryPixelPos, HistoryPixelPosToScreenPos);
+   // → NDC [-1,1]，用于几何计算
+
+InputPPCo = ApplyScreenTransform(HistoryPixelPos, HistoryPixelPosToInputPPCo);
+   // → 低清像素坐标（浮点），用于采样低清纹理
+```
+
+`InputPPCo` 就是高清输出像素对应到低清输入图像中的浮点坐标（如 `50.3, 25.7`），是 C++ 侧预合并的一次性变换。`InputPPCk = floor(InputPPCo) + 0.5` 找到最近的整数输入像素中心。
+
+### 6.4 数据读取
+
+每个输出像素读取：
+
+```hlsl
+// ① 反走样偏移（低清 AntiAliasingTexture，来自 SpatialAntiAliasing）
+RawEncodedInputTexelOffset = AntiAliasingTexture[LocalInputPixelPos];
+
+// ② MV（低清 ReprojectionVectorTexture，可能已被补洞 MV 替换）
+RawEncodedReprojectionVector = ReprojectionVectorTexture[LocalInputPixelPosWithReprojectionAA];
+
+// ③ Rejection 权重（低清 HistoryRejectionTexture，来自 RejectShading）
+RawHistoryRejection = HistoryRejectionTexture[LocalInputPixelPos];
+// .r = LowFrequencyRejection, .g = DisableHistoryClamp, .b = DecreaseValidityMultiplier
+// .a bitmask: bit0 = bIsParallaxRejected, bit1 = bIsHistoryResurrection
+
+// ④ Reprojection Boundary（低清，仅 bReprojectionField）
+EncodedReprojectionBoundary = ReprojectionBoundaryTexture[LocalInputPixelPos];
+```
+
+### 6.5 Reprojection Boundary：亚像素深度边缘偏移
+
+从深度空间反走样结果解码，判断历史像素是否在膨胀侧，决定 MV 的采样偏移方向：
+
+```hlsl
+BoundaryDilateOffset = select(
+    IsHistoryPixelWithinOffsetBoundary(dInputKO, ReprojectionBoundary),
+    +ReprojectionOffset,   // 在膨胀侧：用膨胀 MV → 偏移到最近深度像素读 MV
+    -ReprojectionOffset);  // 在中心侧：用中心 MV
+```
+
+### 6.6 Jacobian：亚像素 MV 修正
+
+Jacobian `J²ˣ²` 编码了输入像素内 MV 随子像素位置的变化率，修正输出像素的 MV：
+
+```hlsl
+JacobianCoordinate = dInputKO - BoundaryDilateOffset;
+ReprojectionPixelPosCorrection = mul(JacobianCoordinate, ReprojectionJacobian);
+LocalReprojectionVector = DecodedMV + ReprojectionScreenPosCorrection;
+```
+
+同一输入像素覆盖多个输出像素 → MV 应有微调 → Jacobian 修正。**修正的是 MV，不是像素坐标**。
+
+### 6.7 高清历史采样：Catmull-Rom 双三次
+
+```hlsl
+PrevHistoryBufferUV = ApplyScreenTransform(PrevScreenPos, ScreenPosToPrevHistoryBufferUV);
+for (uint i = 0; i < 16; i++)
+{
+    PrevHighFrequency += BilinearSampleColorHistory(PrevHistoryColorTexture, UV[i], FrameIndex)
+                       * KernelWeight[i] * PreExposureCorrection;
+}
+```
+
+从 `PrevHistoryColorTexture`（高清多帧纹理数组）的对应帧采样，双三次 Catmull-Rom 16 个采样点加权合并。若产生负值（HDR 采样常见问题），回退到最近采样点。
+
+**复活帧索引切换**：若 `bIsHistoryResurrection` 为 true（由 RejectShading 判定），采样时使用 `ResurrectionFrameIndex` 而非普通 `PrevFrameIndex`：
+
+```hlsl
+bIsHistoryResurrection = (HistoryRejection.a * 255 & 0x2) != 0;
+float FrameIndex = select(bIsHistoryResurrection, ResurrectionFrameIndex, PrevFrameIndex);
+```
+
+### 6.8 当前帧空间滤波：多采样上采样核
+
+```hlsl
+for (uint SampleId = 0; SampleId < CONFIG_SAMPLES_COUNT; SampleId++)
+{
+    ComputeInputKernelSamplePosition(InputPixelPos, dInputKO, SampleId, ...);
+    InputColor = InputSceneColorTexture[SamplePixelPos[i]];
+    ToneWeight = HdrWeight4(InputColor);
+    FilteredInputColor += SampleSpatialWeight * ToneWeight * InputColor;
+}
+```
+
+不是简单双线性，而是在低清帧的多个采样点上加权滤波。权重：
+- **空间权重**：基于采样点到输出像素的距离
+- **HDR Tone Weight**：亮度越高权重越大，防止 HDR 亮点在混合中丢失
+- 采样点采集 min/max 构建 clamp 盒，用于后续钳位历史色
+
+### 6.9 核宽度自适应
+
+```hlsl
+KernelInputToHistoryFactor = lerp(
+    1.0 - 0.5 * NoiseFiltering,   // 不可靠 → 窄核
+    InputToHistoryFactor,         // 可靠 → 宽核（上采样拉伸）
+    LowFrequencyRejection > 阈值);
+```
+
+Rejection 高（历史可靠）→ 宽核 → 平滑上采样。Rejection 低 → 窄核 → 不依赖历史。
+
+### 6.10 历史钳位
+
+```hlsl
+ClampedPrevHighFrequencyColor = clamp(PrevHighFrequencyColor, InputMinColor, InputMaxColor);
+BlendedPrevHighFrequencyColor = HdrWeightLerp(
+    ClampedPrevHighFrequencyColor, PrevHighFrequencyColor, DisableHistoryClamp);
+```
+
+ghosting → 钳回。`DisableHistoryClamp` 控制钳位力度。
+
+### 6.11 运动压制 Validity
+
+```hlsl
+MaxValidity = 1.0 - WeightClampingPixelSpeedAmplitude * saturate(OutputPixelVelocity * InvWeightClampingPixelSpeed);
+PrevWeight = min(PrevWeight, MaxValidity);
+```
+
+运动越快 → Validity 越低 → 历史权重降低 → 保持运动清晰度。
+
+### 6.12 亮度对比稳定增强
+
+```hlsl
+MinValidityForStability = |FilteredLuma - PrevHistoryLuma| / max(FilteredLuma, PrevHistoryLuma);
+MaxValidity = max(MaxValidity, MinValidityForStability);
+```
+
+亮差大 → 提升 min validity → 允许更多历史 → 防闪烁。
+
+### 6.13 最终混合
+
+```hlsl
+FinalHighFrequencyColor = (
+    BlendedPrevHighFrequencyColor * (PrevWeight * PrevHistoryToneWeight) +
+    FilteredInputColor * (CurrentWeight * FilteredInputToneWeight)
+) / CommonWeight;
+```
+
+HDR 感知的加权混合，双方各有独立 tone weight。
+
+### 6.14 输出
+
+| 输出 | 纹理 | 用途 |
+|------|------|------|
+| `HistoryColorOutput` | `History.ColorArray` | 高清历史颜色，下帧 PrevHistoryColorTexture |
+| `HistoryMetadataOutput` | `History.MetadataArray` | 高清历史元数据 |
+| `UpdateHistoryTextureSRV` | `History.ColorArray` SRV | 当前帧画面输出（或经 ResolveHistory 降采样） |
+
+### 6.15 ResolveHistory
+
+若 `HistorySize > OutputRect.Size()` → 额外降采样到输出分辨率。否则直接输出。
+
+---
+
+## 7. TSR 整体数据流总览
+
+```
+Pass                       输出纹理                     后续使用者（输入到哪个 pass）
+────────────────────────────────────────────────────────────────────────────────────────
+ClearPrevTextures          TSR.PrevAtomics             → DilateVelocity.PrevAtomicOutput
+                                                       → DecimateHistory.PrevAtomicTextureArray
+
+
+DilateVelocity             ClosestDepthOutput           → DecimateHistory.ClosestDepthTexture
+                                                       → RejectShading.ClosestDepthTexture
+
+                           R8Output slice[0]: DilateMask → DecimateHistory.DilateMaskTexture
+                           R8Output slice[1]: DeviceZError → DecimateHistory.DepthErrorTexture
+                           R8Output slice[2]: IsMovingMask → RejectShading.IsMovingMaskTexture
+
+                           ReprojectionFieldOutput
+                             slice[0]: 膨胀 MV         → DecimateHistory.DilatedReprojectionVectorTexture (读)
+                                                        → UpdateHistory.ReprojectionVectorTexture (读)
+                             slice[1]: Jacobian        → UpdateHistory.ReprojectionJacobianTexture
+                             slice[2]: ReprojectionBoundary → UpdateHistory.ReprojectionBoundaryTexture
+                             slice[3]: 降采样 MV        ← DecimateHistory 写入
+                                                        → UpdateHistory.ReprojectionVectorTexture (读)
+
+                           PrevAtomicOutput (Scatter)  → DecimateHistory.PrevAtomicTextureArray
+
+
+DecimateHistory            ReprojectedHistoryGuideOutput → RejectShading.ReprojectedHistoryGuideTexture
+                           (slice 0: GuideColor, slice 1: Uncertainty)
+                           (slice 2/3: Resurrection color if enabled)
+
+                           DecimateMaskOutput           → RejectShading.DecimateMaskTexture
+                           (.r=DecimateBitMask, .g=ReprojectionEdge)
+
+                           ReprojectionFieldOutput
+                             slice[0]/[3]: 降采样 MV   → UpdateHistory.ReprojectionVectorTexture
+                             slice[1]: Jacobian (清零)  → UpdateHistory.ReprojectionJacobianTexture
+
+
+RejectShading              History.GuideArray           → 下一帧 DecimateHistory.PrevHistoryGuide
+                           HistoryRejectionOutput       → UpdateHistory.HistoryRejectionTexture
+                           InputSceneColorOutput        → UpdateHistory.InputSceneColorTexture
+                           InputSceneColorLdrLumaOutput → SpatialAntiAliasing.InputSceneColorLdrLumaTexture
+                           AntiAliasMaskOutput          → SpatialAntiAliasing.AntiAliasMaskTexture
+
+
+SpatialAntiAliasing        AntiAliasingOutput           → UpdateHistory.AntiAliasingTexture
+
+
+UpdateHistory              History.ColorArray           → 下一帧 DecimateHistory.PrevHistoryColorTexture
+                           (也作为当前帧画面输出)        → 屏幕 / 后续后处理
+                           History.MetadataArray        → 下一帧的 PrevHistoryMetadataTexture
+                           History.GuideArray           → 下一帧 DecimateHistory.PrevHistoryGuide
+                           (如果 RejectShading 未写入时复用已有数据)
+
+(ResolveHistory)           (仅在 HistorySize > OutputRect 时运行，降采样到输出分辨率)
+```
+
+```
+输出纹理跨帧使用示意:
+
+帧 N:
+  RejectShading  → History.GuideArray  ──┐
+  UpdateHistory  → History.ColorArray ──┐│
+                                        ││
+帧 N+1:                                 ↓↓
+  DecimateHistory ← PrevHistoryGuide ───┘│
+  DecimateHistory ← PrevHistoryColorArray┘
+```
