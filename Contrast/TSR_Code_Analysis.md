@@ -1458,7 +1458,8 @@ DilateVelocity     TSR.PrevAtomics (RW, ← ClearPrevTex)   ClosestDepthOutput
                                                           R8Output slice[2]: IsMovingMask
                                                           → RejectShading: IsMovingMaskTexture (R)
 
-                                                         ReprojectionFieldOutput slice[0]或[3]: 膨胀 MV (由 C++ 控制)
+                                                         ReprojectionFieldOutput
+                                                           slice[0]或[3]: 膨胀 MV (由 C++ 控制)
                                                          → DecimateHistory 读取 (SRV)
                                                          → UpdateHistory 读取 (SRV)
                                                          ReprojectionFieldOutput slice[1]: Jacobian
@@ -1471,16 +1472,21 @@ DilateVelocity     TSR.PrevAtomics (RW, ← ClearPrevTex)   ClosestDepthOutput
 
 
 DecimateHistory    DilatedReprojectionVecTex (R, ← Dilate) ReprojectedHistoryGuideOutput
-                   DilateMaskTexture (R, ← Dilate)         → RejectShading: ReprojectedHistoryGuideTex (R)
-                   DepthErrorTexture (R, ← Dilate)           slice[0]: GuideColor + Uncertainty
-                   ClosestDepthTexture (R, ← Dilate)         (slice[2/3]: 复活 Guide → RejectShading (R))
-                   PrevAtomicTextureArray (R, ← Dilate)
-                   PrevHistoryGuide (R, ← 上帧 Reject)    DecimateMaskOutput (.r=BitMask, .g=Edge)
-                                                          → RejectShading: DecimateMaskTexture (R)
-                                                          ReprojectionFieldOutput slice[0]: 降采样/补洞 MV
-                                                          → UpdateHistory: ReprojectionVectorTex (R)
-                                                            ReprojectionFieldOutput slice[1]: Jacobian 清零 (仅补洞像素)
-                                                          → UpdateHistory: ReprojectionJacobianTex (R)
+                   DilateMaskTexture (R, ← Dilate)           slice[0]: GuideColor + Uncertainty
+                   DepthErrorTexture (R, ← Dilate)           → RejectShading: ReprojectedHistoryGuideTex (R)
+                   ClosestDepthTexture (R, ← Dilate)         slice[1]: Uncertainty (Alpha路径)
+                   PrevAtomicTextureArray (R, ← Dilate)      → RejectShading: ReprojectedHistoryGuideMetadataTex (R)      
+                   PrevHistoryGuide (R, ← 上帧 Reject)        slice[2]: 复活 GuideColor (Alpha路径)  
+                                                             → RejectShading: ResurrectedHistoryGuideTex (R)
+                                                             slice[3]: 复活 Uncertainty (Alpha路径)
+                                                             → RejectShading: ResurrectedHistoryGuideMetadataTex (R)
+
+                                                           DecimateMaskOutput (.r=BitMask, .g=Edge)
+                                                           → RejectShading: DecimateMaskTexture (R)
+                                                           ReprojectionFieldOutput slice[0]: 降采样/补洞 MV
+                                                           → UpdateHistory: ReprojectionVectorTex (R)
+                                                           ReprojectionFieldOutput slice[1]: Jacobian 清零 (仅补洞像素)
+                                                           → UpdateHistory: ReprojectionJacobianTex (R)
 
 
 RejectShading      InputTexture (外部 SceneColor)         History.GuideArray
@@ -1495,12 +1501,12 @@ RejectShading      InputTexture (外部 SceneColor)         History.GuideArray
                                                           → SpatialAntiAliasing: AntiAliasMaskTex (R)
 
 
-SpatialAntiAliasing  AntiAliasMaskTexture (R, ← Reject)   AntiAliasingOutput
+SpatialAntiAliasing  AntiAliasMaskTexture (R, ← Reject)      AntiAliasingOutput
                      InputSceneColorLdrLumaTex (R, ← Reject) → UpdateHistory: AntiAliasingTex (R)
 
 
-UpdateHistory      PrevHistoryColorTex (R, ← 上帧 Update) History.ColorArray
-                   PrevHistoryMetadataTex (R, ← 上帧 Up)   → 下帧 UpdateHistory: PrevHistoryColorTex (R)
+UpdateHistory      PrevHistoryColorTex (R, ← 上帧 Update)   History.ColorArray
+                   PrevHistoryMetadataTex (R, ← 上帧 Up)     → 下帧 UpdateHistory: PrevHistoryColorTex (R)
                    HistoryRejectionTex (R, ← Reject)        → ResolveHistory: UpdateHistoryOutputTex (R)
                    InputSceneColorTex (R, ← Reject)         → 屏幕 / 后续后处理 (HistorySize==OutputRect)
                    ReprojectionVectorTex (R, ← Dec)        History.MetadataArray
