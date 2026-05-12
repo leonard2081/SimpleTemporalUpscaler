@@ -442,7 +442,7 @@ DecimateHistory 是 TSR 重投影的核心 pass，负责：
 
 | 方向 | 纹理 | 关键信息 |
 |------|------|----------|
-| **输入** | `DilatedReprojectionVecTex` (← Dilate) | 膨胀后的 MV，用于重投影和边缘检测 |
+| **输入** | `DilatedReprojectionVecTex` (← Dilate) | 膨胀后的 MV (R，bReprojField=true 时读 slice[3])，用于重投影和边缘检测 |
 | | `DilateMaskTexture` (← Dilate) | ReprojectionEdge + HasReprojectionOffset |
 | | `DepthErrorTexture` (← Dilate) | 深度误差容差 |
 | | `ClosestDepthTexture` (← Dilate) | `.r`: 上一帧最近深度, `.g`: 当前最近深度 |
@@ -1458,13 +1458,13 @@ DilateVelocity     TSR.PrevAtomics (RW, ← ClearPrevTex)   ClosestDepthOutput
                                                           R8Output slice[2]: IsMovingMask
                                                           → RejectShading: IsMovingMaskTexture (R)
 
-                                                          ReprojectionFieldOutput slice[0]: 膨胀 MV
-                                                          → DecimateHistory: DilatedReprojectionVecTex (R)
-                                                          → UpdateHistory: ReprojectionVectorTex (R)
-                                                          ReprojectionFieldOutput slice[1]: Jacobian
-                                                          → UpdateHistory: ReprojectionJacobianTex (R)
-                                                          ReprojectionFieldOutput slice[2]: 边界
-                                                          → UpdateHistory: ReprojectionBoundaryTex (R)
+                                                         ReprojectionFieldOutput slice[0]或[3]: 膨胀 MV (由 C++ 控制)
+                                                         → DecimateHistory 读取 (SRV)
+                                                         → UpdateHistory 读取 (SRV)
+                                                         ReprojectionFieldOutput slice[1]: Jacobian
+                                                         → UpdateHistory: ReprojectionJacobianTex (R)
+                                                         ReprojectionFieldOutput slice[2]: 边界
+                                                         → UpdateHistory: ReprojectionBoundaryTex (R)
 
                                                           PrevAtomicOutput (Scatter 写入)
                                                           → DecimateHistory: PrevAtomicTextureArray (R)
@@ -1477,10 +1477,9 @@ DecimateHistory    DilatedReprojectionVecTex (R, ← Dilate) ReprojectedHistoryG
                    PrevAtomicTextureArray (R, ← Dilate)
                    PrevHistoryGuide (R, ← 上帧 Reject)    DecimateMaskOutput (.r=BitMask, .g=Edge)
                                                           → RejectShading: DecimateMaskTexture (R)
-                                                          ReprojectionFieldOutput
-                                                            ReprojVecIdx 切片: MV (补洞 MV 替换)
+                                                          ReprojectionFieldOutput slice[0]: 降采样/补洞 MV
                                                           → UpdateHistory: ReprojectionVectorTex (R)
-                                                            slice[1]: Jacobian 清零 (仅补洞像素)
+                                                            ReprojectionFieldOutput slice[1]: Jacobian 清零 (仅补洞像素)
                                                           → UpdateHistory: ReprojectionJacobianTex (R)
 
 
