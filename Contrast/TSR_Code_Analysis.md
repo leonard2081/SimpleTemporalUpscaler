@@ -815,10 +815,19 @@ RejectShading 是 TSR 时序稳定性决策的最终关口，负责：
 | | `IsMovingMaskTexture` (← Dilate) | 闪烁检测标志 |
 | | `ClosestDepthTexture` (← Dilate) | 最近深度 (g 通道) |
 | **输出** | `History.GuideArray` | 下一帧的低清 Guide 颜色 (混合当前+历史) |
-| | `HistoryRejectionOutput` | `.r`: LowFrequencyRejection, `.g`: DisableHistoryClamp, `.b`: DecreaseValidity, `.a`: bitmask (disocclusion/resurrection) |
+| | `HistoryRejectionOutput` | 4 通道打包的 rejection 参数 (详见下表) |
 | | `InputSceneColorOutput` | 合成完整当前帧颜色 (不透明+半透明) |
 | | `InputSceneColorLdrLumaOutput` | LDR 亮度 (供空域反走样边缘检测) |
 | | `AntiAliasMaskOutput` | 需要反走样的像素标记 |
+
+HistoryRejectionOutput 各分量含义:
+
+| 通道 | 名称 | 取值范围 | 含义 | UpdateHistory 中的用法 |
+|------|------|----------|------|----------------------|
+| `.r` | **LowFrequencyRejection** | [0, 1] | 历史可信度，1.0=历史可靠，0.0=拒绝历史 | 决定上采样核宽度和最终 blend 比例 |
+| `.g` | **DisableHistoryClamp** | [0, 1] | 历史钳位力度，1.0=正常钳位，0.0=禁用钳位 | HDRWeightLerp(钳后历史, 原始历史, Clamp) |
+| `.b` | **DecreaseValidityMultiplier** | [0, 1] | 降低历史有效度的乘数 | 运动压制: `MaxValidity = 1.0 − K × DecreaseValidity` |
+| `.a` | **Bitmask** | 整数[0,255] | bit0: bIsParallaxRejected, bit1: bIsHistoryResurrection | 切换复活帧索引、判断 disocclusion 状态 |
 
 ### 4.2 线程模型：Lane + SIMD + Tensor
 
