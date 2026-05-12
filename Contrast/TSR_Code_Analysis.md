@@ -1212,7 +1212,7 @@ UpdateHistory 是 TSR 的最终输出 pass，负责：
 | | `ReprojectionBoundaryTex` (← Dilate) | 深度边缘亚像素边界 |
 | | `AntiAliasingTex` (← SpatialAA) | 空间反走样亚像素采样偏移 |
 | **输出** | `History.ColorArray` | 高清历史颜色 (当前帧画面 + 下帧历史) |
-| | `History.MetadataArray` | 高清历史元数据 |
+| | `History.MetadataArray` | `FinalHistoryValidity` (R8, 8bit)，当前帧的历史有效权重 = `ceil(255 × (CurrentWeight + PrevWeight)) / 255`，下帧读回后用于约束历史累积粒度：高 validity → 可继续累积，低 validity → 减少累积防止失真 |
 
 ### 6.2 线程模型：高清 + 双像素向量化
 
@@ -1379,7 +1379,7 @@ HDR 感知的加权混合，双方各有独立 tone weight。
 | 输出 | 纹理 | 用途 |
 |------|------|------|
 | `HistoryColorOutput` | `History.ColorArray` | 高清历史颜色，下帧 PrevHistoryColorTexture |
-| `HistoryMetadataOutput` | `History.MetadataArray` | 高清历史元数据 |
+| `HistoryMetadataOutput` | `History.MetadataArray` | `FinalHistoryValidity` (R8)，当前帧历史有效权重，下帧读回约束累积粒度 |
 | `UpdateHistoryTextureSRV` | `History.ColorArray` SRV | 当前帧画面输出（或经 ResolveHistory 降采样） |
 
 ### 6.15 ResolveHistory
@@ -1508,7 +1508,7 @@ DecimateHistory    DilatedReprojectionVecTex (R, ← Dilate) ReprojectedHistoryG
                                                            → UpdateHistory: ReprojectionJacobianTex (R)
 
 
-RejectShading      InputTexture (外部 SceneColor)         History.GuideArray
+RejectShading      InputTexture (外部 SceneColor)         HistoryGuideOutput
                    InputSceneTranslucencyTexture (外部)    → 下帧 DecimateHistory: PrevHistoryGuide (R)
                    ReprojectedHistoryGuideTex (R, ← Dec)  HistoryRejectionOutput
                    DecimateMaskTexture (R, ← Dec)         → UpdateHistory: HistoryRejectionTex (R)
@@ -1524,17 +1524,17 @@ SpatialAntiAliasing  AntiAliasMaskTexture (R, ← Reject)      AntiAliasingOutpu
                      InputSceneColorLdrLumaTex (R, ← Reject) → UpdateHistory: AntiAliasingTex (R)
 
 
-UpdateHistory      PrevHistoryColorTex (R, ← 上帧 Update)   History.ColorArray
-                   PrevHistoryMetadataTex (R, ← 上帧 Up)    → 下帧 UpdateHistory: PrevHistoryColorTex (R)
+UpdateHistory      PrevHistoryColorTex (R, ← 上帧 Update)    HistoryColorOutput
+                   PrevHistoryMetadataTex (R, ← 上帧 Up)     → 下帧 UpdateHistory: PrevHistoryColorTex (R)
                    HistoryRejectionTex (R, ← Reject)        → ResolveHistory: UpdateHistoryOutputTex (R)
                    InputSceneColorTex (R, ← Reject)         → 屏幕 / 后续后处理 (HistorySize==OutputRect)
-                   ReprojectionVectorTex (R, ← Dec)        History.MetadataArray
-                   ReprojectionJacobianTex (R, ← Dil/Dec)   → 下帧 UpdateHistory: PrevHistoryMetadataTex (R)
-                   ReprojectionBoundaryTex (R, ← Dilate)
+                    ReprojectionVectorTex (R, ← Dec)        HistoryMetadataOutput (PF_R8)：历史有效权重
+                    ReprojectionJacobianTex (R, ← Dil/Dec)  → 下帧 UpdateHistory: PrevHistoryMetadataTex (R)
+                    ReprojectionBoundaryTex (R, ← Dilate)  
                    AntiAliasingTex (R, ← SpatialAA)
 
 
-ResolveHistory     UpdateHistoryOutputTex (R, ← Update)   SceneColorOutputTexture
+ResolveHistory     UpdateHistoryOutputTex (R, ← Update)   SceneColorOutput
                    (仅 HistorySize > OutputRect 时运行)    → 屏幕 / 后续后处理
 ```
 
@@ -1542,8 +1542,8 @@ ResolveHistory     UpdateHistoryOutputTex (R, ← Update)   SceneColorOutputText
 
 ```
 帧 N:
-  RejectShading  → History.GuideArray  → QueueExtract → 下帧 InputHistory.GuideArray
-  UpdateHistory  → History.ColorArray  → QueueExtract → 下帧 InputHistory.ColorArray
+  RejectShading  → HistoryGuideOutput (→ QueueExtract → 下帧 InputHistory.GuideArray)
+  UpdateHistory  → HistoryColorOutput (→ QueueExtract → 下帧 InputHistory.ColorArray)
 
 帧 N+1:
   DecimateHistory ← InputHistory.GuideArray   (PrevHistoryGuide, 低清, 重投影参考)
