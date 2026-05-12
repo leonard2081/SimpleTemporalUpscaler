@@ -449,8 +449,18 @@ DecimateHistory 是 TSR 重投影的核心 pass，负责：
 | | `PrevAtomicTextureArray` (← Dilate) | 散射的最近深度 + hole-filling velocity |
 | | `PrevHistoryGuide` (← 上帧 Reject) | 历史帧低清引导颜色 |
 | **输出** | `ReprojectedHistoryGuideOutput` | 重投影后的历史 Guide 颜色 + uncertainty (+ 复活色) |
-| | `DecimateMaskOutput` | `.r`: DecimateBitMask (像素状态标志), `.g`: ReprojectionEdge |
+| | `DecimateMaskOutput` | `.r`: DecimateBitMask (5 bit 像素状态, 见下表), `.g`: ReprojectionEdge |
 | | `ReprojectionFieldOutput` | 降采样/补洞后的 MV + Jacobson (覆盖写入) |
+
+DecimateBitMask 各 bit 含义:
+
+| Bit | 标志 | 含义 |
+|-----|------|------|
+| 0 | `bIsOffScreen` | 重投影越界或 CameraCut → 当前帧不在上一帧可见范围内 |
+| 1 | `bIsParallaxDisocclusion` | 视差遮挡 → 上一帧中该位置被前景遮挡 |
+| 2 | `bHasPixelAnimation` | 像素动画 → MV 无法精确对齐的材质动画 |
+| 3 | `bReprojectionHollFill` | 补洞有效 → 可用前景 MV 从历史帧采样背景 |
+| 4 | `bIsResurrectionOffScreen` | 复活越界 → 复活帧中当前像素不可见 |
 
 ### 3.2 坐标映射：Map8x8Tile2x2Lane
 
