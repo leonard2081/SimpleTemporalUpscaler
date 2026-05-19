@@ -256,6 +256,43 @@ SceneColor / SceneDepth / SceneVelocity / View / PrevHistory
 | `PreparedInputColorTexture` | `PF_FloatRGBA`，input res，非 Ultra | `Accumulate.r_prepared_input_color` | 预处理后的当前帧颜色。 |
 | Ultra 无 prepared color | - | `Accumulate` 直接读 `SceneColor` | Ultra 省带宽路径。 |
 
+### `DilatedReactiveMaskTexture` 细节
+
+`DilatedReactiveMaskTexture` 不是简单把输入的 reactive mask / composite mask 透传成两个通道。Depth Clip 会对输入 mask 做邻域扩张、颜色相似性加权，并合并 motion divergence / temporal motion difference 后再输出。
+
+非 Ultra 路径中，输入是两张单通道 mask：
+
+| 输入 | 来源 | 说明 |
+|---|---|---|
+| `r_reactive_mask` | `ReactiveMaskTexture` | 原始 reactive mask。 |
+| `r_transparency_and_composition_mask` | `CompositeMaskTexture` | transparency / composition / reflection 相关 mask。 |
+
+`PreProcessReactiveMasks()` 的处理逻辑可以概括为：
+
+1. 初始化输出因子：`fReactiveFactor = float2(0, fMotionDivergence)`，因此 `.y` 从一开始就包含 motion divergence。
+2. 对 `r_reactive_mask` 做 3x3 邻域 gather，得到 9 个 reactive samples。
+3. 对 `r_transparency_and_composition_mask` 做 3x3 邻域 gather，得到 9 个 composition samples。
+4. 如果邻域 mask 有非零值，再读取 3x3 input color，用中心颜色和邻域颜色计算相似性。
+5. 根据颜色相似性调整邻域 mask 强度：颜色越不相似，mask 样本会被更强地压低，避免跨明显颜色边界过度扩张。
+6. 对加权后的邻域 reactive / composition mask 取最大值，得到输出双通道。
+
+因此非 Ultra 下更接近：
+
+```text
+DilatedReactiveMaskTexture.x = max_3x3(weighted reactive mask)
+DilatedReactiveMaskTexture.y = max(motion divergence / temporal motion difference,
+                                   max_3x3(weighted composition mask))
+```
+
+后续 Accumulate 读取后拆成：
+
+| 通道 | Accumulate 变量 | 作用 |
+|---|---|---|
+| `.x` | `params.fDilatedReactiveFactor` | 当前帧 reactive factor，越高越减少历史颜色权重。 |
+| `.y` | `params.fAccumulationMask` | accumulation / composition mask，影响 rectification、luma history 采样和 lock 生命周期。 |
+
+另外，Depth Clip 本身会计算 `fDepthClip`。非 Ultra 下它不写入 `DilatedReactiveMaskTexture.x`，而是写入 `PreparedInputColorTexture.a`，供 Accumulate 的 `SampleDepthClip()` 读取。Ultra Performance 路径不同，`DilatedReactiveMaskTexture.x` 会用于保存 `fDepthClip`，`.y` 主要来自 motion divergence / temporal motion difference。
+
 ---
 
 ## 7. Lock Pass
