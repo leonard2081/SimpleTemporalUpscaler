@@ -46,10 +46,15 @@ SceneColor / SceneDepth / SceneVelocity / View / PrevHistory
 | `PrevDilatedMotionVectors` | 上一帧 RPD RT1 | Depth Clip 比较上一帧 dilated MV。 |
 | `PrevDilatedDepthMotionVectorsInputLuma` | 上一帧 Ultra RPD RT0 | Ultra Performance 合并格式历史。 |
 | `PrevLockStatus` | 上一帧 Accumulate lock status RT | 延续 lock 状态。 |
-| `NewLock` | 上一帧 lock UAV | 本帧清空后由 Lock pass 写入。 |
 | `PrevPreExposure` | 上一帧 `fPreExposure` | 曝光连续性修正。 |
 
-如果 camera cut 或历史无效，上述资源会替换为 black dummy，并重置 `FRAME_INDEX`。
+如果 camera cut 或历史无效，上述历史资源会替换为 black dummy，并重置 `FRAME_INDEX`。
+
+### 当前帧复用 / 中间资源
+
+| 资源 | 来源 | 本帧用途 |
+|---|---|---|
+| `NewLock` | 优先复用 `PrevHistory->NewLock` 的纹理对象；本帧开始会 clear | 由当前帧 Lock pass 写入 new lock mask，随后 Accumulate 作为 `r_new_locks` 读取；它不是算法意义上的历史输入。 |
 
 ---
 
@@ -345,6 +350,54 @@ SceneColor / SceneDepth / SceneVelocity / View / PrevHistory
 - `LumaHistoryOutputTexture`：Quality 模式保存亮度历史，用于检测 shading change 和历史稳定性。
 - `InternalReactiveOutput`：Balanced/Performance 模式使用的 reactive 历史，成本低于完整 luma history。
 - `ArmASROutputSceneColor`：最终输出给 UE renderer 的 full-res color。若启用 RCAS，则由 RCAS 写入。
+
+### 最终混色影响因素
+
+`Accumulate` 的最终混色可以简化理解为：
+
+```text
+history = Reproject(PrevUpscaledColour, motionVector)
+history = ExposureCorrect(history)
+history = Rectify(history, currentNeighborhood, depthClip, reactive, lock, lumaInstability)
+
+current = Upsample(CurrentFrameColor, jitter)
+
+alpha = currentWeight / (historyWeight + currentWeight)
+final = lerp(history, current, alpha)
+```
+
+其中 `alpha` 越大，当前帧颜色占比越高，响应更快、拖影更少，但可能更闪；`alpha` 越小，历史颜色占比越高，画面更稳，但更容易 ghosting / smearing。
+
+| 因素 | 来源 | 如何影响混色 |
+|---|---|---|
+| 历史有效性 / motion vector | `GetMotionVector()`、`ComputeReprojectedUVs()` | motion vector 决定上一帧历史颜色采样位置。若重投影 UV 出屏幕、camera cut 或 reset frame，则视为 new sample，基本直接使用当前帧颜色。 |
+| `PrevUpscaledColour` | 上一帧 Accumulate RT0 | 提供历史颜色 `fHistoryColor`。历史正确时提升稳定性；历史错误时会被 depth clip、reactive、rectification 等机制降权或修正。 |
+| 当前帧 upsampled color / weight | `ComputeUpsampledColorAndWeight()` | `.xyz` 是当前帧重建颜色，`.w` 是当前帧样本权重。`.w` 越大，最终 `alpha` 越大，当前帧颜色占比越高。 |
+| 当前 reactive factor | `DilatedReactiveMaskTexture.x` | 来自 `ReactiveMask / CompositeMask -> DepthClip`。值越大，说明当前区域越不适合依赖历史，会降低历史累积权重。 |
+| 历史 temporal reactive | Quality 中来自 `PrevUpscaledColour.a`；Balanced/Performance 中来自 `PrevInternalReactive` | 按 motion vector 重投影采样后得到 `fTemporalReactiveFactor`，与当前 reactive 取 `max`。即使当前帧 reactive 变弱，上一帧的不稳定性也会延续，继续减少历史依赖。 |
+| `fThisFrameReactiveFactor` | `max(params.fDilatedReactiveFactor, fTemporalReactiveFactor)` | 直接进入历史累积权重：`historyWeight *= (1 - fThisFrameReactiveFactor)`。值越大，历史越少，当前帧越多。 |
+| depth clip factor | `DepthClip` 输出；非 Ultra 下存于 `PreparedInputColor.a` | 反映遮挡/反遮挡/深度不连续。值越大，历史越不可信，历史权重乘以 `(1 - depthClip)`，减少 ghosting。 |
+| accumulation mask | `DilatedReactiveMaskTexture.y` | 来自 composition / transparency mask、motion divergence 等。它会影响 rectification、luma history 采样和 lock 生命周期，使透明、反射、运动发散区域更保守地使用历史。 |
+| motion speed / `fHrVelocity` | motion vector 乘以输出尺寸 | 速度越高，基础历史累积越低；同时会影响 rectification box 和下一帧 temporal reactive，减少运动拖影。 |
+| `bInMotionLastFrame` | temporal reactive 的符号，历史中负值表示上一帧高速运动 | 若上一帧处于高速运动，即使当前速度降低，也会暂时限制历史累积，减少运动后残留拖影。 |
+| `NewLock` / `PrevLockStatus` | Lock pass 输出与上一帧 lock status | `NewLock` 标记当前帧细线/高频结构，`PrevLockStatus` 保存 lock lifetime 与 temporal luma。有效 lock 会提高历史细节保留，减少细线闪烁；reactive、depth clip、accumulation mask 高时会削弱或杀掉 lock，避免锁住错误历史。 |
+| `PrevLumaHistory` / luma instability | Quality 模式 Accumulate RT2 | 保存最近 4 帧量化亮度历史。它不直接作为混色权重，而是影响 history rectification，判断历史颜色是否应被当前邻域颜色范围裁剪。 |
+| rectification clipping box | 当前帧邻域颜色，由 `ComputeUpsampledColorAndWeight()` 构造 | 若历史颜色落在当前邻域颜色范围外，会 clamp 到当前颜色范围，降低 ghosting；lock / luma instability 可允许保留更多历史以减少闪烁；reactive 高会削弱历史保留。 |
+| 曝光 / PreExposure | 当前 `ViewInfo.PreExposure` 与上一帧 `PrevPreExposure` | 不直接改变权重，但会把历史颜色转换到当前曝光空间后再混合，避免曝光变化导致历史颜色过亮或过暗。 |
+| jitter / jitter sequence | `ViewInfo.TemporalJitterPixels`、`JitterSequenceLength()` | jitter 决定当前帧子像素采样位置，多帧积累提升细节；jitter sequence 也影响 lock lifetime 衰减。 |
+| RCAS | `r.ArmASR.Sharpness > 0` | 不参与 Accumulate 内部历史/当前帧混色，只在 Accumulate 之后对 internal upscaled color 做锐化并写最终输出。 |
+
+关键方向总结：
+
+| 因素增大 | 混色趋势 |
+|---|---|
+| reactive factor 增大 | 减少历史，多用当前帧。 |
+| depth clip 增大 | 减少历史，防止遮挡 ghosting。 |
+| motion velocity 增大 | 减少历史，防止运动拖影。 |
+| accumulation mask 增大 | 削弱 lock / 历史稳定性。 |
+| lock contribution 增大 | 更保留历史细节，减少细线闪烁。 |
+| current upsample weight 增大 | 当前帧颜色占比提高。 |
+| history invalid / reset | 直接使用当前帧初始化历史。 |
 
 ---
 
