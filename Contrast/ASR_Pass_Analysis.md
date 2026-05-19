@@ -320,6 +320,133 @@ DilatedReactiveMaskTexture.y = max(motion divergence / temporal motion differenc
 |---|---|---|---|
 | `NewLock` | `PF_R8`，GLES 为 `PF_R32_FLOAT`，output res | `Accumulate.r_new_locks`，并提取到 `NewHistory->NewLock` | 当前帧新 lock mask，用于更新 lock status。 |
 
+### Lock 细节
+
+Lock 机制用于稳定细线、高频纹理、亚像素边缘等容易随 temporal jitter 闪烁的细节。它分成两部分：
+
+1. `Lock Pass` 根据当前帧亮度生成 `NewLock`。
+2. `Accumulate Pass` 结合 `NewLock` 和上一帧 `PrevLockStatus` 维护完整 lock 状态，并让 lock 影响历史颜色保留。
+
+#### `r_lock_input_luma` 存储内容
+
+非 Ultra 下，`r_lock_input_luma` 来自 `Reconstruct Previous Depth Pass` 的 `LockLumaTexture`，格式为 `PF_R16F`。它存储当前帧 per-pixel luma，用于 Lock pass 做局部亮度结构检测。
+
+Ultra Performance 下没有单独的 `LockLumaTexture`，luma 被打包在 `DilatedDepthMotionVectorsInputLumaTexture.w` 中：
+
+```text
+DilatedDepthMotionVectorsInputLumaTexture.x  = dilated depth
+DilatedDepthMotionVectorsInputLumaTexture.yz = dilated motion vector
+DilatedDepthMotionVectorsInputLumaTexture.w  = luma
+```
+
+因此 Lock pass 的细线检测主要看亮度结构，而不是直接看完整 RGB 颜色。颜色只会通过转换后的 luma 间接影响 lock 检测。
+
+#### `NewLock` 存储内容
+
+`NewLock` 是当前帧新检测出的 thin feature / 细线候选 mask。当前实现基本是二值：
+
+| 值 | 含义 |
+|---|---|
+| `0.0` | 当前像素未检测到新 lock。 |
+| `1.0` | 当前像素检测到 thin feature，需要建立 new lock。 |
+
+本帧开始时 `NewLock` 会被 clear，然后 Lock pass 只在检测成功的位置写入 `1.0`。它不是完整 lock 状态，只是当前帧的 new lock 候选。
+
+#### Lock 检测依据
+
+Lock pass 的核心检测函数是 `ComputeThinFeatureConfidence()`，主要步骤如下：
+
+1. 读取当前像素亮度 `fNucleus = LoadLockInputLuma(pos)`。
+2. 读取 3x3 邻域亮度样本。
+3. 用亮度比值判断邻居是否与中心相似，阈值约为 `1.05`，也就是亮度差异约 5% 内认为相似。
+4. 判断中心像素是否是局部 ridge：中心亮度要么比所有不相似邻居更亮，要么更暗。
+5. 使用 4 个 2x2 rejection masks 排除大块相似区域，避免把普通面片误判为细线。
+6. 如果通过检测，则写入 `NewLock = 1.0`。
+
+因此 Lock 更容易检测黑白细线、高亮度对比边缘、栅栏、发丝等亮度高频结构；对于色相变化明显但亮度接近的细节不敏感。
+
+#### `PrevLockStatus` 存储内容
+
+完整 lock 状态不是 `NewLock`，而是 Accumulate 输出的 `LockStatusOutputTexture`，下一帧作为 `PrevLockStatus` 输入。其格式是 `PF_G16R16F`，两个通道语义为：
+
+| 通道 | 含义 |
+|---|---|
+| `.x` / `LOCK_LIFETIME_REMAINING` | lock 剩余生命周期。 |
+| `.y` / `LOCK_TEMPORAL_LUMA` | lock 关联的 temporal luma。 |
+
+`PrevLockStatus` 会在下一帧 Accumulate 中按重投影 UV 采样：
+
+```text
+current pixel -> motion vector -> previous frame UV -> sample PrevLockStatus
+```
+
+这样可以判断该像素对应的历史位置上一帧是否已经处于 locked 状态。
+
+#### 为什么 `NewLock` 和 `PrevLockStatus` 分开
+
+| 资源 | 空间 / 语义 | 用途 |
+|---|---|---|
+| `NewLock` | 当前帧 high-res 像素位置 | 当前帧 Lock pass 检测出的新 lock 候选。 |
+| `PrevLockStatus` | 上一帧历史状态，按重投影 UV 采样 | 保存已有 lock 的生命周期和 temporal luma。 |
+
+二者不能简单合并，因为：
+
+- `NewLock` 是当前帧检测结果，`PrevLockStatus` 是历史状态。
+- `NewLock` 按当前像素位置读取，`PrevLockStatus` 按重投影 UV 读取。
+- `NewLock` 是单通道 mask，`PrevLockStatus` 是双通道状态。
+- Accumulate 需要同时知道“当前是否新检测到 lock”和“上一帧是否已经 locked”。
+
+#### Lock 状态如何维护
+
+Accumulate 中会读取：
+
+```text
+NewLock          -> state.NewLock
+PrevLockStatus   -> state.WasLockedPrevFrame + fLockStatus
+```
+
+如果当前帧检测到 `NewLock`：
+
+```text
+LOCK_TEMPORAL_LUMA      = 当前 shading change luma
+LOCK_LIFETIME_REMAINING = 1.0 或 2.0
+```
+
+如果没有新的 lock，但旧 lock 生命周期还较短，则会逐渐更新 temporal luma；如果亮度变化过大，则 kill lock。
+
+lock 生命周期还会被以下因素削弱：
+
+| 因素 | 对 lock 的影响 |
+|---|---|
+| reactive factor 高 | `LOCK_LIFETIME_REMAINING *= (1 - reactive)`，减少 lock。 |
+| accumulation mask 高 | `LOCK_LIFETIME_REMAINING *= (1 - accumulationMask)`，减少 lock。 |
+| depth clip 高 | depth clip 不稳定时 kill / 禁用 lock。 |
+| 估计下一帧 UV 出屏幕 | kill lock，避免屏幕边界锁住错误历史。 |
+| jitter 累积进度 | lock lifetime 随当前帧 upsample weight / jitter sequence 逐步衰减。 |
+
+#### Lock 如何影响后续 Accumulate 混色
+
+Lock 不直接输出最终颜色，也不直接改变当前帧 `SceneColor`。它通过 `fLockContributionThisFrame` 影响 Accumulate 的 history rectification。
+
+当历史颜色落在当前帧颜色邻域 clipping box 外时，Accumulate 会倾向于把历史颜色 clamp 到当前邻域范围，以减少 ghosting。但有效 lock 会允许保留更多历史细节：
+
+```text
+lock contribution 高 -> 更多保留历史颜色 -> 减少细线 / 高频细节闪烁
+```
+
+同时，如果 reactive、depth clip 或 accumulation mask 较高，lock 会被削弱或杀掉：
+
+```text
+不稳定区域 -> 减少 lock -> 避免锁住错误历史 -> 降低拖影
+```
+
+所以 lock 的作用是平衡：
+
+| 场景 | Lock 行为 |
+|---|---|
+| 静止或稳定的细线 / 高频结构 | 保留更多历史，减少 shimmer。 |
+| 遮挡变化、透明、反射、快速运动区域 | 削弱或取消 lock，避免 ghosting。 |
+
 ---
 
 ## 8. Accumulate Pass
