@@ -208,6 +208,105 @@ SceneColor / SceneDepth / SceneVelocity / View / PrevHistory
 |---|---|---|---|
 | `ExposureTexture` | `PF_A32B32G32R32F`，1x1 | `RPD`、`Depth Clip`、`Accumulate`、`RCAS` | 当前帧曝光。 |
 
+### 关键信息
+
+#### `EyeAdaptationBuffer` 与 `ExposureTexture.x`
+
+`EyeAdaptationBuffer` 在 shader 侧是 `StructuredBuffer<float4>`，不是单个裸标量。`CopyExposure.usf` 通过 UE 的 `EyeAdaptationLookupBuffer(EyeAdaptationBuffer)` 读取其中的 eye adaptation / auto exposure 参数，并写入 1x1 `ExposureTexture`。
+
+后续 ASR 主要读取 `ExposureTexture[0,0].x`：
+
+```text
+Exposure() = r_input_exposure[uint2(0, 0)].x
+```
+
+这个 `.x` 可以理解为当前帧 eye adaptation / auto exposure 得到的曝光倍率，用来把线性 HDR 场景颜色转换到当前视觉曝光空间。若该值为 `0`，shader 会回退为 `1.0`。
+
+#### 与 Compute Luminance Pyramid 的关系
+
+ASR 有两种曝光来源：
+
+| 条件 | 曝光来源 |
+|---|---|
+| `r.ArmASR.AutoExposure=1` 且非 Ultra | Compute Luminance Pyramid 输出的 `AutoExposureTexture`。 |
+| 未请求 ASR AutoExposure，或 Ultra | CopyExposure 从 UE `EyeAdaptationBuffer` 拷贝到 `ExposureTexture`。 |
+
+因此可以理解为：如果不使用 UE 的曝光值，就需要由前面的亮度金字塔根据当前 `SceneColor` 自己计算 `AutoExposureTexture`。Ultra Performance 跳过 Compute Luminance Pyramid，因此只能使用 UE 的曝光值。
+
+#### `Exposure` 与 `PreExposure` 的区别
+
+`ExposureTexture.x` 和 `ViewInfo.PreExposure` 都与曝光有关，但职责不同：
+
+| 名称 | 来源 | 含义 | 是否作为 history 存储 |
+|---|---|---|---|
+| `ExposureTexture.x` | UE `EyeAdaptationBuffer` 或 ASR `AutoExposureTexture` | 当前帧相机 / eye adaptation 的曝光倍率，用于 ASR 内部视觉曝光空间。 | 不作为单独 history 存储。 |
+| `PreExposure()` | `ViewInfo.PreExposure` | UE 写入 / 保存 `SceneColor` 时提前乘上的预曝光倍率，用于保持 HDR 数值稳定。 | 当前帧会存为 `NewHistory->PreExposure`。 |
+| `PreviousFramePreExposure()` | `PrevHistory->PreExposure` | 上一帧保存 history color 时使用的 pre-exposure。 | 从上一帧 history 读取。 |
+
+可以把颜色空间简化为：
+
+```text
+StoredSceneColor = PhysicalSceneColor * PreExposure
+ExposedColor     = PhysicalSceneColor * Exposure
+DisplayColor     = Tonemap(PhysicalSceneColor * Exposure)
+```
+
+`PhysicalSceneColor` 是场景物理 / 线性 HDR 光照结果，本身不随相机曝光变化；`Exposure` 决定它进入 tonemapper 前的亮度尺度；`PreExposure` 是 UE 内部为了数值稳定而使用的 scene color 存储尺度。
+
+#### 后续如何使用曝光值
+
+非 Ultra 路径中，ASR 会用 `PrepareRgb()` / `UnprepareRgb()` 在不同颜色空间之间转换：
+
+```text
+PrepareRgb(color, Exposure, PreExposure):
+  color / PreExposure * Exposure
+
+UnprepareRgb(color, Exposure):
+  color / Exposure * CurrentPreExposure
+```
+
+含义是：
+
+1. 当前帧输入 `SceneColor` 通常已经是 `PhysicalSceneColor * CurrentPreExposure`，ASR 先除以 `CurrentPreExposure`，再乘当前 `Exposure`，得到 `PhysicalSceneColor * CurrentExposure`。
+2. 历史颜色通常保存为 `PhysicalSceneColor * PreviousFramePreExposure`，下一帧重投影后会除以 `PreviousFramePreExposure`，再乘当前 `Exposure`，也转换到 `PhysicalSceneColor * CurrentExposure`。
+3. Accumulate 内部的历史重投影、颜色邻域 clipping box、rectification、luma instability、lock、shading change、RCAS 等判断都在这个当前视觉曝光空间中进行。
+4. 最终输出 / history 写回前再除以当前 `Exposure`，乘回当前 `PreExposure`，回到 UE 后续后处理期望的 pre-exposed scene color 空间。
+
+#### history 中保存的颜色不是最终送显颜色
+
+非 Ultra 路径下，ASR history / output RGB 大致保存为：
+
+```text
+HistoryRGB ≈ PhysicalSceneColor * CurrentPreExposure
+```
+
+它不是：
+
+```text
+PhysicalSceneColor * Exposure
+```
+
+也不是 tone mapping 后的最终显示颜色。最终送显颜色通常是：
+
+```text
+DisplayColor = Tonemap(PhysicalSceneColor * Exposure)
+```
+
+ASR 保存 pre-exposed HDR scene color，是为了下一帧还能在 HDR / 线性空间进行时域重建，并让 UE 后续 tonemapper 继续按正常流程应用当前曝光和色彩变换。
+
+#### 为什么最终会除回 `Exposure` 还要拷贝它
+
+虽然 ASR 最终会通过 `UnprepareRgb()` 把颜色从 `PhysicalSceneColor * Exposure` 转回 `PhysicalSceneColor * PreExposure`，看起来 `Exposure` 被抵消了，但它仍然影响中间算法行为。
+
+`Exposure` 的意义不是改变 ASR 最终输出空间，而是让 ASR 的内部比较和判断更接近当前帧最终视觉结果：
+
+- 当前帧和历史帧颜色都被转换到同一个 `PhysicalSceneColor * CurrentExposure` 空间后再比较。
+- rectification / clipping box 基于曝光后的颜色范围，避免在纯物理 HDR 数值空间中被极亮高光过度主导。
+- luma instability、shading change、lock 相关亮度判断更接近当前眼适应后的视觉亮度。
+- RCAS 锐化也需要在合理的曝光空间中处理 HDR 颜色。
+
+因此 CopyExposure 的核心价值是：把 UE 已经计算好的当前帧曝光倍率提供给 ASR，让内部时域累积、历史裁剪和锐化等判断发生在一致的当前视觉曝光空间中，而最终输出仍回到 UE 期望的 pre-exposed scene color 空间。
+
 ---
 
 ## 5. Reconstruct Previous Depth Pass
