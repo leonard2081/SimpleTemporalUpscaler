@@ -70,12 +70,41 @@ SceneColor / SceneDepth / SceneVelocity / View / PrevHistory
 
 主要步骤：
 
-1. 解码 `GBufferB/GBufferD` 得到 roughness、shading model、custom data。
-2. 比较 `SceneColor` 与 `SceneColorPreAlpha` 估计 translucency。
-3. 根据深度计算世界空间距离，对 roughness / translucency 做距离衰减。注意当前 C++ 参数绑定实际始终传入 `r.ArmASR.ReactiveMaskRoughnessMaxDistance`，没有使用 `View.FurthestReflectionCaptureDistance`。
-4. 使用 reflection texture 或 Lumen specular 计算反射贡献。
-5. 特殊 reactive shading model 可强制写入 reactive 值。
-6. 输出 `CompositeMask = Output.x`，`ReactiveMask = max(ForceReactive, Output.y)`。
+1. 读取并解码 GBuffer：
+   - `GBufferB` / `GBufferD` 由 `PostInputs.SceneTextures` 提供。
+   - `GBufferB` 主要用于解出 `Roughness` 和 `ShadingModelID`；在 UE 常规 deferred GBuffer 布局中，roughness 通常在 `GBufferB.b`，shading model ID 通常打包在 `GBufferB.a`。
+   - `GBufferD` 主要用于解出 `CustomData`，常用 `CustomData.x/y`。
+   - 实际代码不直接按通道硬读，而是通过 `DecodeGBufferData()` 得到 `GBuffer.Roughness`、`GBuffer.ShadingModelID`、`GBuffer.CustomData`。
+
+2. 处理材质 custom data：
+   - `CustomData.x` 不是任意材质都能自由写入的通用用户槽位，它的语义由当前像素的 `ShadingModelID` 决定。
+   - 例如 `SHADINGMODELID_CLEAR_COAT` 下，`CustomData.x/y` 会被当作 clear coat / clear coat roughness 使用，shader 会用它修正 roughness。
+   - 只有当 `GBuffer.ShadingModelID == r.ArmASR.ReactiveMaskReactiveShadingModelID` 时，ASR 才把 `GBuffer.CustomData.x` 解释为强制 reactive 值。
+   - 如果 `r.ArmASR.ReactiveMaskForceReactiveMaterialValue > 0`，则使用该 CVar 值覆盖材质 `CustomData.x`。
+
+3. 比较 `SceneColor` 与 `SceneColorPreAlpha` 估计透明贡献：
+   - `SceneColorPreAlpha` 来自 opaque 后、alpha/translucency 合成前的场景颜色快照；如果没有该纹理，则回退为 `SceneColor`。
+   - shader 计算 `Delta = abs(SceneColor - SceneColorPreAlpha)`，用颜色差异估计透明 / alpha 合成对当前像素的贡献。
+   - 这个透明贡献会分别进入 reactive mask 和 composite mask 的候选值。
+
+4. 根据深度反推距离，并对 roughness / translucency 做距离衰减：
+   - shader 从 `InputDepth` 读取当前像素深度，用 `SvPositionToTranslatedWorld()` 得到当前像素对应表面点的 `TranslatedWorldPosition`。
+   - `TranslatedWorldPosition` 是 UE 渲染中平移后的世界空间位置，通常可近似理解为 `WorldPosition - CameraWorldPosition`；它的原点在相机附近，但坐标轴仍是世界轴，不等同于 view space。
+   - `length(TranslatedWorldPosition)` 用于估算像素表面到相机的世界空间距离。
+   - roughness 路径会根据距离把 `Roughness` 逐渐推向 `1.0`，从而削弱远处低 roughness 表面对 reactive 的贡献。注意当前 C++ 参数绑定实际始终传入 `r.ArmASR.ReactiveMaskRoughnessMaxDistance`，没有使用 `View.FurthestReflectionCaptureDistance`。
+   - translucency 路径会根据 `r.ArmASR.ReactiveMaskTranslucencyMaxDistance` 将远处透明贡献逐渐压到 `0`，避免天空盒、远处背景板或后期合成远景大面积写入 reactive。
+
+5. 使用 `ReflectionTexture` 或 `LumenSpecular` 估计反射贡献：
+   - `ReflectionTexture` 来自 UE reflection denoiser 的 `Outputs.Color`，可以理解为当前帧反射管线输出的屏幕空间反射结果。通常 `Reflection.rgb` 表示反射颜色，`Reflection.a` / `.w` 表示反射有效性、强度或权重。
+   - 对于粗糙或没有有效反射结果的像素，`ReflectionTexture` 通常接近 `float4(0,0,0,0)`，或者至少 `Reflection.w == 0`。
+   - 当 `Reflection.w > 0` 时，shader 优先用 `Reflection.w` 和 `Luminance(Reflection.rgb)` 计算反射贡献；反射越强、越亮，贡献越高。
+   - 如果 `ReflectionTexture` 无效，则尝试使用 `LumenSpecular`。`LumenSpecular` 只有在当前 view 使用 Lumen Reflections、Lumen reflection history 有效且 ASR history 有效时才会绑定真实纹理，否则是 black dummy。
+   - 如果 `ReflectionTexture` 和 `LumenSpecular` 都无效，则使用 roughness fallback：`(1 - Roughness) * r.ArmASR.ReactiveMaskRoughnessScale`，即越光滑越可能给一点反射相关 mask，越粗糙贡献越低。
+
+6. 合成输出 mask：
+   - 反射贡献主要进入 `CompositeMaskTexture`，即 `CompositeMask = saturate(TranslucencyContribution.x + ReflectionContribution)`。
+   - `ReactiveMaskTexture` 主要来自透明 history 贡献和特殊 reactive shading model 的强制值，即 `ReactiveMask = max(ForceReactive, TranslucencyContribution.y)`。
+   - 后续 Depth Clip 会读取这两张 mask，做邻域扩张、颜色相似性加权，并合并 motion divergence / temporal motion difference，最终形成 `DilatedReactiveMaskTexture.xy` 供 Accumulate 使用。
 
 ### 输入
 
