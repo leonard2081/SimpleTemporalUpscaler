@@ -14,7 +14,7 @@ SceneColor / SceneDepth / SceneVelocity / View / PrevHistory
   -> Create Reactive Mask       [可选，非 Ultra]
   -> ConvertVelocity
   -> Compute Luminance Pyramid  [非 Ultra]
-  -> CopyExposure               [不用 ASR AutoExposure 或 Ultra]
+  -> CopyExposure               [未请求 ASR AutoExposure，或 Ultra]
   -> Reconstruct Previous Depth
   -> Depth Clip
   -> Lock
@@ -34,14 +34,14 @@ SceneColor / SceneDepth / SceneVelocity / View / PrevHistory
 | `VelocityTexture` | `Inputs.SceneVelocity.Texture` | UE 输出的 scene velocity。 |
 | `View` | `FSceneView` / `ViewUniformBuffer` | 矩阵、viewport、曝光、jitter 等。 |
 | `SceneTextures` | `ArmASRInfo.PostInputs.SceneTextures` | GBuffer 等，用于 Reactive Mask。 |
-| `LumenReflections` | `ArmASRInfo.LumenReflections` | Lumen reflection history。 |
+| `LumenReflections` | `ArmASRInfo.LumenReflections` | Lumen reflection history；只有 history 有效且当前 view 使用 Lumen Reflections 时才会被 Create Reactive Mask 绑定，否则使用 black dummy。 |
 
 ### 历史输入
 
 | 历史资源 | 来源 | 本帧用途 |
 |---|---|---|
 | `PrevUpscaledColour` | 上一帧 Accumulate RT0 | 颜色历史重投影。 |
-| `PrevInternalReactive` | 上一帧 Balanced/Performance Accumulate RT1 | temporal reactive history。 |
+| `PrevInternalReactive` | 上一帧非 Quality 路径提取的 history；在 Balanced/Performance 中对应 Accumulate RT1 temporal reactive。Ultra Performance 当前 C++ 也会提取 RT1 到该成员，但其 shader 输出语义与 LockStatus 在 RT1 上重合，属于实现细节，不能简单理解为独立的 reactive history。 | 本帧 Accumulate 的 temporal reactive 输入。 |
 | `PrevLumaHistory` | 上一帧 Quality Accumulate RT2 | luma / shading change history。 |
 | `PrevDilatedMotionVectors` | 上一帧 RPD RT1 | Depth Clip 比较上一帧 dilated MV。 |
 | `PrevDilatedDepthMotionVectorsInputLuma` | 上一帧 Ultra RPD RT0 | Ultra Performance 合并格式历史。 |
@@ -72,7 +72,7 @@ SceneColor / SceneDepth / SceneVelocity / View / PrevHistory
 
 1. 解码 `GBufferB/GBufferD` 得到 roughness、shading model、custom data。
 2. 比较 `SceneColor` 与 `SceneColorPreAlpha` 估计 translucency。
-3. 根据深度计算世界空间距离，对 roughness / translucency 做距离衰减。
+3. 根据深度计算世界空间距离，对 roughness / translucency 做距离衰减。注意当前 C++ 参数绑定实际始终传入 `r.ArmASR.ReactiveMaskRoughnessMaxDistance`，没有使用 `View.FurthestReflectionCaptureDistance`。
 4. 使用 reflection texture 或 Lumen specular 计算反射贡献。
 5. 特殊 reactive shading model 可强制写入 reactive 值。
 6. 输出 `CompositeMask = Output.x`，`ReactiveMask = max(ForceReactive, Output.y)`。
@@ -87,7 +87,7 @@ SceneColor / SceneDepth / SceneVelocity / View / PrevHistory
 | `InputDepth` | `SceneDepth` | 当前深度。 |
 | `SceneColor` | `SceneColor` | 当前最终场景色。 |
 | `SceneColorPreAlpha` | `ArmASRInfo.SceneColorPreAlpha` 或 `SceneColor` | alpha 前颜色，用于估计透明贡献。 |
-| `LumenSpecular` | `ArmASRInfo.LumenReflections` 或 black dummy | Lumen specular 历史。 |
+| `LumenSpecular` | `ArmASRInfo.LumenReflections` 或 black dummy | 只有在 history 有效且当前 view 确认使用 Lumen Reflections 时才会绑定。 |
 | `InputVelocity` | 原始 `VelocityTexture` | Lumen specular 重投影。 |
 | `View` | `View.ViewUniformBuffer` | 矩阵、viewport、深度转换。 |
 | Reactive CVars | `r.ArmASR.ReactiveMask*` | 控制反射、透明、roughness 权重。 |
@@ -161,11 +161,11 @@ SceneColor / SceneDepth / SceneVelocity / View / PrevHistory
 
 - Wrapper：`Source/ArmASR/Private/Shaders/ArmASRCopyExposure.h`
 - Shader：`Shaders/Private/CopyExposure.usf`
-- 运行条件：`r.ArmASR.AutoExposure=0` 或 Ultra。
+- 运行条件：未请求 ASR AutoExposure，或处于 Ultra。等价于 `!(r.ArmASR.AutoExposure != 0 && !UltraPerformance)`。
 
 ### 核心逻辑
 
-从 UE `EyeAdaptationBuffer` 读取曝光，写入 1x1 `ExposureTexture`。
+从 UE `EyeAdaptationBuffer` 读取曝光，写入 1x1 `ExposureTexture`。当 `r.ArmASR.AutoExposure=1` 且非 Ultra 时，本步骤会被前面的 Compute Luminance Pyramid 产物替代；其他情况都走这里。
 
 ### 输入
 
@@ -476,7 +476,7 @@ lock contribution 高 -> 更多保留历史颜色 -> 减少细线 / 高频细节
 | `r_lock_status` | `PrevHistory->LockStatus` | 上一帧 lock status。 |
 | `r_imgMips` | Compute Luminance 输出，非 Ultra | shading change 检测。 |
 | `r_luma_history` | `PrevHistory->LumaHistory`，Quality | 亮度历史。 |
-| `r_internal_temporal_reactive` | `PrevHistory->InternalReactive`，Balanced/Performance | temporal reactive 历史。 |
+| `r_internal_temporal_reactive` | `PrevHistory->InternalReactive`，Balanced/Performance | temporal reactive 历史；Ultra shader 路径不绑定独立 temporal reactive 输入。 |
 | `r_new_locks` | Lock 输出 `NewLock` | 当前帧 lock mask。 |
 
 ### 输出
@@ -589,7 +589,7 @@ RCAS，即 Robust Contrast Adaptive Sharpening，对 Accumulate 输出的内部 
 
 | 输出 | 格式 / 尺寸 | 去向 | 说明 |
 |---|---|---|---|
-| `ArmASROutputSceneColor` | full-res output | `Outputs.FullRes.Texture` | 最终锐化后的全分辨率颜色。 |
+| `ArmASROutputSceneColor` | full-res output | `Outputs.FullRes.Texture` | 最终锐化后的全分辨率颜色；当前 wrapper 通过 pixel shader `RenderTargets[0]` 写入，虽然参数结构中保留了 `rw_upscaled_output` UAV 声明。 |
 
 ---
 
@@ -601,7 +601,7 @@ RCAS，即 Robust Contrast Adaptive Sharpening，对 Accumulate 输出的内部 
 | `Accumulate RT0 InternalUpscaledColor` | `NewHistory->UpscaledColour` | 下一帧 Accumulate。 |
 | `Accumulate LockStatus RT` | `NewHistory->LockStatus` | 下一帧 Accumulate。 |
 | Quality：`Accumulate RT2 LumaHistory` | `NewHistory->LumaHistory` | 下一帧 Accumulate。 |
-| Balanced/Performance：`Accumulate RT1 InternalReactive` | `NewHistory->InternalReactive` | 下一帧 Accumulate。 |
+| 非 Quality：`NewHistory->InternalReactive` | Balanced/Performance 中来自 `Accumulate RT1 InternalReactive`；Ultra Performance 当前 C++ 也会提取 Accumulate RT1 到该成员，但该 RT1 在 shader 输出语义上是 LockStatus，属于实现细节/潜在问题。 | Balanced/Performance 下一帧 Accumulate 的 temporal reactive 输入；Ultra 不绑定独立 temporal reactive 输入。 |
 | 非 Ultra：`RPD RT1 DilatedMotionVector` | `NewHistory->DilatedMotionVectors` | 下一帧 Depth Clip。 |
 | Ultra：`RPD RT0 DilatedDepthVelocityLuma` | `NewHistory->DilatedDepthMotionVectorsInputLuma` | 下一帧 Depth Clip / Accumulate。 |
 | `fPreExposure` | `NewHistory->PreExposure` | 下一帧 common params。 |
@@ -626,7 +626,7 @@ UE Inputs:
         |-- Compute Luminance Pyramid [non-Ultra]
         |      outputs: MipShadingChangeTexture, AutoExposureTexture
         |
-        |-- CopyExposure [when not ASR auto exposure or Ultra]
+        |-- CopyExposure [when not ASR auto exposure, or Ultra]
         |      outputs: ExposureTexture
         |
         |-- Reconstruct Previous Depth
@@ -641,7 +641,7 @@ UE Inputs:
         |
         |-- Accumulate
         |      outputs: InternalUpscaledColor, LockStatus,
-        |               LumaHistory or InternalReactive,
+        |               LumaHistory or InternalReactive depending on quality path,
         |               FinalColor if RCAS disabled
         |
         |-- RCAS [optional]
@@ -657,5 +657,5 @@ UE Inputs:
 5. 质量档位主要影响中间 RT 数量、格式和历史信息保存方式：
    - Quality：保留 `LumaHistory`，颜色历史为 `PF_FloatRGBA`。
    - Balanced/Performance：使用 `InternalReactive`，颜色历史为 `PF_FloatR11G11B10`。
-   - Ultra Performance：跳过 reactive mask 和 luminance pyramid，并合并 depth/mv/luma。
+   - Ultra Performance：跳过 reactive mask 和 luminance pyramid，并合并 depth/mv/luma；shader 不输出独立 temporal reactive RT，但当前 C++ history 仍会填充 `InternalReactive` 成员，且与 RT1 LockStatus 输出存在重合这一实现细节。
 6. 最终输出：不开锐化由 `Accumulate` 写；开启锐化由 `RCAS` 写。
