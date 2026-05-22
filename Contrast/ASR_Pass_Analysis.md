@@ -392,6 +392,63 @@ ASR 保存 pre-exposed HDR scene color，是为了下一帧还能在 HDR / 线�
 
 调用 `DepthClip(uPixelCoord)`：比较 reconstructed previous nearest depth、当前扩张深度、当前/历史 motion vector，并结合 reactive mask 判断历史是否可信。非 Ultra 下还会输出 prepared / tonemapped input color。
 
+主要步骤：
+
+1. 读取当前像素的 dilated motion vector，并丢弃极小运动：
+   - 从 `r_dilated_motion_vectors` 或 Ultra 合并纹理中读取当前像素的扩张 motion vector。
+   - 若 `length(MotionVector * DisplaySize()) <= 0.01`，则把 motion vector 置为 0。
+   - 目的：使用 Reconstruct Previous Depth Pass 生成的稳定 motion vector 做历史重投影，同时过滤掉极小 velocity 噪声，避免无意义的历史采样偏移。
+
+2. 计算上一帧重投影位置并读取当前扩张深度：
+   - 当前像素 UV 为 `(iPxPos + 0.5) / RenderSize()`。
+   - 上一帧重投影 UV 为 `fDilatedUv = fDepthUv + fMotionVector`。
+   - 当前深度使用扩张深度 `LoadDilatedDepth(iPxPos)`。
+   - 目的：确定当前像素在上一帧历史中的采样位置，并准备与上一帧重建最近深度进行比较。
+
+3. 计算 depth clip factor：
+   - `ComputeDepthClip(fDilatedUv, fDilatedDepth)` 会在上一帧重投影位置的 bilinear footprint 内读取 `ReconstructedPreviousNearestDepthTexture`。
+   - 将当前扩张深度和上一帧重建最近深度都转换到 view space 后比较。
+   - 当当前深度相对上一帧最近深度表现出明显分离时，说明历史样本可能来自错误表面，depth clip 会升高。
+   - 计算中会根据 FOV、分辨率、深度距离估算允许的深度分离阈值，避免远近距离使用同一固定阈值。
+   - 目的：检测遮挡 / 反遮挡、前景物体移开后露出背景、动态边界等历史不可信区域，供 Accumulate 降低历史颜色依赖。
+
+4. 使用 `EvaluateSurface()` 对 depth clip 做局部深度结构过滤：
+   - 沿 Y 方向读取 `ReconstructedPreviousNearestDepthTexture` 的相邻深度样本。
+   - 如果局部深度呈现容易造成误判的连续阶跃结构，会抑制 depth clip。
+   - 目的：减少某些斜面、深度阶梯或局部表面形态导致的过度 depth clip，降低 temporal instability。
+
+5. 非 Ultra 下生成 prepared input color，并把 depth clip 存入 alpha：
+   - 读取当前 `SceneColor` 并执行 `max(rgb, 0)`。
+   - 调用 `PrepareRgb(rgb, Exposure(), PreExposure())`，即 `rgb / PreExposure * Exposure`，把颜色转换到当前视觉曝光空间。
+   - 根据 permutation 输出 tonemapped RGB 或 `RGBToYCoCg` 后的颜色。
+   - 写入 `PreparedInputColorTexture.rgb`，同时将 `fDepthClip` 写入 `PreparedInputColorTexture.a`。
+   - 目的：给 Accumulate 提供统一曝光空间下的当前帧颜色，用于颜色邻域、rectification、history clamp 等；同时复用 alpha 通道传递 depth clip，避免额外 RT。Ultra 模式不输出 prepared color，后续 Accumulate 直接读 `SceneColor`。
+
+6. 计算空间 motion divergence：
+   - `ComputeMotionDivergence()` 在当前像素 3x3 邻域中采样 input motion vector。
+   - 比较中心 motion vector 与邻域 motion vector 的方向一致性；方向差异越大，divergence 越高。
+   - 目的：检测运动场不连续区域，例如前景 / 背景边界、动态物体边缘、旋转或变形区域。这些位置历史重投影更容易出错，需要降低历史累积。
+
+7. 计算 temporal motion divergence，并结合 depth divergence 抑制误判：
+   - `ComputeTemporalMotionDivergence()` 使用当前 dilated motion vector 重投影到上一帧，并采样上一帧 dilated motion vector history。
+   - 比较当前 motion vector 与上一帧对应位置 motion vector 的长度差异，运动距离越大、差异越明显，temporal divergence 越高。
+   - `ComputeDepthDivergence()` 在 3x3 邻域中计算 dilated depth 的深度跨度，用于识别局部几何深度边界。
+   - 最终使用 `saturate(TemporalMotionDivergence - DepthDivergence)`，避免把纯几何深度边缘完全误判成 temporal motion divergence。
+   - 目的：检测时序上的运动不一致、新暴露区域和动态边界，同时降低纯深度边缘导致的过度 reactive。
+
+8. 预处理 reactive / composition mask，并合并 motion divergence：
+   - 输入 motion divergence 为 `max(TemporalMotionDifference, MotionDivergence)`。
+   - 非 Ultra 下，对 `r_reactive_mask` 和 `r_transparency_and_composition_mask` 做 3x3 邻域 gather。
+   - 如果邻域 mask 非零，则再采样 3x3 当前输入颜色，用中心颜色与邻域颜色计算相似性。
+   - 对颜色不相似的邻域样本提高 power，从而压低跨明显颜色边界扩张过来的 mask。
+   - 最终取 3x3 加权 mask 最大值，输出 `DilatedReactiveMaskTexture.xy`。
+   - 目的：对 reactive / composition 信息做颜色感知扩张，补偿后续 Accumulate 双线性采样，同时避免 mask 跨边界污染；并把运动不连续信息合入 accumulation mask。
+
+9. 输出结果给 Accumulate：
+   - 非 Ultra：`DilatedReactiveMaskTexture.x` 是颜色加权扩张后的 reactive factor，`.y` 是 composition mask 与 motion divergence 的合并结果；`PreparedInputColorTexture.rgb` 是 prepared 当前帧颜色，`.a` 是 depth clip factor。
+   - Ultra：不输出 prepared color；`DilatedReactiveMaskTexture.x` 保存 depth clip，`.y` 保存 motion divergence / temporal motion difference。
+   - 目的：让 Accumulate 在执行历史重投影和颜色累积前，已经拿到历史可信度、当前帧颜色预处理结果，以及透明 / 反射 / 运动不连续区域的历史降权信息。
+
 ### 输入
 
 | Shader 输入 | 来源 | 说明 |
