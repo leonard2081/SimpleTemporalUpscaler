@@ -319,6 +319,39 @@ ASR 保存 pre-exposed HDR scene color，是为了下一帧还能在 HDR / 线�
 
 调用 `ReconstructAndDilate(uPixelCoord)`：用当前深度和 motion vector 重建前一帧最近深度，并在邻域中扩张 depth / motion vector / luma，提升运动边界和薄几何体处的稳定性。Ultra 模式将 depth、motion vector、luma 合并为一个 RT。
 
+主要步骤：
+
+1. 在当前低分辨率像素的 3x3 邻域中查找最近深度：
+   - 读取当前像素周围 9 个 `r_input_depth` 样本。
+   - inverted depth 下 device depth 越大表示越近，因此选择最大 depth；非 inverted depth 则选择最小 depth。
+   - 输出 `fDilatedDepth` 和最近深度所在坐标 `iNearestDepthCoord`。
+   - 目的：执行 depth dilation，让运动边界、薄几何体、前景轮廓附近的像素更倾向使用最近前景深度，减少背景深度污染前景边缘。
+
+2. 用最近深度坐标确定 motion vector 采样点：
+   - 当前 ASR 使用 low resolution motion vectors，因此 `iMotionVectorPos = iNearestDepthCoord`。
+   - 然后从 `r_input_motion_vectors` 读取 `fDilatedMotionVector`。
+   - 目的：让扩张后的 depth 和 motion vector 来自同一个最近前景样本，避免出现“depth 是前景、motion vector 却是背景”的错配。
+
+3. 使用扩张后的 depth 和 motion vector 重建上一帧最近深度：
+   - 当前像素 UV 为 `(iPxPos + 0.5) / RenderSize()`。
+   - 根据 motion vector 计算上一帧位置：`fReprojectedUv = fUv + fDilatedMotionVector`。
+   - 对重投影位置做 bilinear footprint 计算，将当前 `fDilatedDepth` 写入覆盖到的最多 4 个上一帧 texel。
+   - 写入时会根据 depth 规则做原子比较：inverted depth 用 `InterlockedMax` 保留最近深度，非 inverted depth 用 `InterlockedMin`。
+   - 目的：生成 `ReconstructedPreviousNearestDepthTexture`，表示当前帧几何按 motion vector 投影回上一帧后，在上一帧各位置可见的最近深度。后续 Depth Clip 用它判断历史样本是否来自同一表面，以及是否发生遮挡 / 反遮挡。
+
+4. 计算 Lock pass 使用的当前像素 luma：
+   - 对当前像素 `iPxLrPos` 读取 `SceneColor`，并执行 `max(rgb, 0)` 避免负颜色影响亮度。
+   - 使用 `rgb / PreExposure() * Exposure()` 转到当前视觉曝光空间。
+   - HDR 输入下再执行 `Tonemap(rgb)`，压缩高亮，避免极亮值主导 lock 检测。
+   - 然后计算 `RGBToPerceivedLuma(rgb)`，并取 `pow(luma, 1/6)`。
+   - 因此 `LockLumaTexture` 可以理解为“当前像素在当前曝光空间下、经过 tonemap 和感知亮度变换后的 lock 专用 luma”，不是简单的线性 `dot(rgb, float3(...))`。
+   - 目的：给 Lock Pass 检测细线、高频纹理、亚像素边缘和亮度 ridge，减少 temporal jitter 下的闪烁。
+
+5. 输出扩张后的 depth / motion vector / luma：
+   - 非 Ultra：分别写入 `DilatedDepthTexture`、`DilatedVelocityTexture`、`LockLumaTexture`。
+   - Ultra：写入合并纹理 `DilatedDepthVelocityLumaTexture`，其中 `.x=depth`，`.yz=motion vector`，`.w=luma`。
+   - 目的：这些结果分别供 Depth Clip 做遮挡判断、供 Accumulate 做历史重投影、供 Lock Pass 做细节稳定性检测，并作为下一帧 history 的一部分继续使用。
+
 ### 输入
 
 | Shader 输入 | 来源 | 说明 |
