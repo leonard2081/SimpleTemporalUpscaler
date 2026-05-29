@@ -43,150 +43,137 @@
     }
     ul, ol { margin: 0.8em 0; }
     li { margin: 0.4em 0; }
+    .note { background: #f9f9f9; border-left: 4px solid #4CAF50; padding: 10px 15px; margin: 1em 0; }
   </style>
+  <!-- MathJax 3 配置，使用备用 CDN -->
   <script>
-    MathJax = {
+    window.MathJax = {
       tex: {
-        inlineMath: [['\\(', '\\)']],
-        displayMath: [['$$', '$$']],
+        inlineMath: [['$', '$'], ['\\(', '\\)']],
+        displayMath: [['$$', '$$'], ['\\[', '\\]']],
         processEscapes: true
+      },
+      options: {
+        ignoreHtmlClass: 'no-math',
+        processHtmlClass: 'math'
       }
     };
   </script>
-  <script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js" async></script>
+  <!-- 备用 CDN -->
+  <script>
+    if (typeof window.MathJax === 'undefined') {
+      document.write('<script src="https://cdnjs.cloudflare.com/ajax/libs/mathjax/3.2.2/es5/tex-mml-chtml.min.js"><\/script>');
+    }
+  </script>
 </head>
 <body>
 
 <h1>LPIPS：学习感知图像块相似度</h1>
 
-<p>LPIPS（Learned Perceptual Image Patch Similarity）是一种基于深度学习的全参考图像质量评价指标。它通过预训练网络的多层特征差异，模拟人类对图像相似度的感知判断，与主观评分高度一致。</p>
+<p>LPIPS（Learned Perceptual Image Patch Similarity）是一种基于深度学习的全参考图像质量评价指标。它利用预训练分类网络的多层特征差异，模拟人类对图像相似度的感知判断，与主观评分高度一致。</p>
+
+<div class="note">
+  <strong>核心要点</strong>：LPIPS 输出一个<strong>感知距离</strong>，数值越小表示两张图越相似（感知质量越好）。
+</div>
 
 <!-- ================== 算法原理 ================== -->
 <h2>一、算法原理</h2>
 
-<h3>1.1 核心思想</h3>
+<h3>1.1 为什么需要 LPIPS？</h3>
 <ul>
-  <li><strong>利用深度网络的内在感知能力</strong>：在 ImageNet 上训练的分类网络（如 AlexNet、VGG）的中间层天然提取了边缘、纹理、物体部件等多层次特征，这些特征与人类视觉系统的层次化处理高度对应。</li>
-  <li><strong>不直接使用分类结果</strong>，而是比较两张图在多个中间层的<strong>内部特征图差异</strong>。</li>
-  <li><strong>通过学习各通道的重要性权重</strong>，将各层差异融合为一个与人类主观评分（MOS）高度相关的距离度量。</li>
+  <li><strong>PSNR/SSIM 的局限</strong>：传统指标只比较浅层像素差异，无法捕捉深层语义和纹理的失真，经常出现“分数高但人眼看着差”的情况。</li>
+  <li><strong>深度特征的自然优势</strong>：在 ImageNet 上训练的分类网络（如 AlexNet、VGG）的中间层会自动提取边缘、纹理、物体部件等层次化特征，与人类视觉通路相似。</li>
+  <li><strong>学习人类判断</strong>：通过大量人类 2AFC 判断数据训练一个轻量加权层，将多层特征差异融合为感知距离。</li>
 </ul>
 
-<h3>1.2 与 PSNR/SSIM 的区别</h3>
-<ul>
-  <li><strong>PSNR</strong>：纯像素误差，与感知偏差大。</li>
-  <li><strong>SSIM</strong>：手工设计的亮度、对比度、结构三要素，缺少高层语义。</li>
-  <li><strong>LPIPS</strong>：端到端学习，从数据中自动获得符合人眼感知的相似度标准。</li>
-</ul>
+<h3>1.2 与常用指标的对比</h3>
+<table>
+  <tr><th>指标</th><th>核心机制</th><th>与人眼一致性</th></tr>
+  <tr><td>PSNR</td><td>像素级 MSE</td><td>差</td></tr>
+  <tr><td>SSIM</td><td>手工设计的亮度、对比度、结构</td><td>中等</td></tr>
+  <tr><td>LPIPS</td><td>深度网络特征差异 + 学习权重</td><td>优秀</td></tr>
+</table>
 
-<h3>1.3 输出含义</h3>
-<p>LPIPS 输出一个<strong>感知距离</strong> \(d(x, x_0)\)，代表失真图 \(x_0\) 相对于参考图 \(x\) 在感知上有多“不像”。<strong>数值越小，表示两张图越相似，质量越好。</strong></p>
-
-<!-- ================== 算法具体步骤 ================== -->
+<!-- ================== 算法步骤 ================== -->
 <h2>二、算法具体步骤</h2>
 
-<p>给定参考图像 \(x\) 和待评估图像 \(x_0\)，计算流程如下：</p>
+<p>给定参考图像 $x$ 和失真图像 $x_0$，LPIPS 的计算分为四步：</p>
 
 <ol>
-  <li>
-    <strong>选择预训练网络</strong>：通常使用 AlexNet 或 VGG，固定所有卷积层权重（作为特征提取器，不参与训练）。
+  <li><strong>提取多层特征</strong>：将 $x$ 和 $x_0$ 分别送入<strong>同一个</strong>预训练网络（如 AlexNet），取出 $L$ 个中间层的特征图。对于第 $l$ 层，得到两个形状为 $C_l \times H_l \times W_l$ 的张量：
+    $$\phi_l(x), \quad \phi_l(x_0)$$
   </li>
-  <li>
-    <strong>提取多层特征</strong>：将 \(x\) 和 \(x_0\) 分别送入<strong>同一个</strong>网络，取出 \(L\) 个中间层的特征图（如 AlexNet 的 conv1～conv5）。<br>
-    对于第 \(l\) 层，得到两个形状为 \(C_l \times H_l \times W_l\) 的三维张量：
-    \[
-    \phi_l(x), \quad \phi_l(x_0)
-    \]
-  </li>
-  <li>
-    <strong>逐通道计算差异</strong>（针对每一层 \(l\)）：
+  <li><strong>计算逐通道差异</strong>（对每一层 $l$）：
     <ol type="a">
-      <li><strong>逐元素相减并平方</strong>：
-        \[
-        \text{Diff}_l = \big( \phi_l(x) - \phi_l(x_0) \big)^2
-        \]
+      <li>逐元素相减并平方：
+        $$\text{Diff}_l = \big( \phi_l(x) - \phi_l(x_0) \big)^2$$
       </li>
-      <li><strong>空间平均</strong>：对每个通道 \(c\)，将其 \(H_l \times W_l\) 个空间位置的差异值取平均，得到该通道的差异标量：
-        \[
-        d_l^c = \frac{1}{H_l W_l} \sum_{h,w} \text{Diff}_l(c, h, w)
-        \]
-        这一步将 \(C_l \times H_l \times W_l\) 的差异图压缩为长度为 \(C_l\) 的向量 \(\mathbf{d}_l\)。
+      <li>空间平均：对每个通道 $c$ 求空间均值，得到一个长度为 $C_l$ 的向量 $\mathbf{d}_l$：
+        $$d_l^c = \frac{1}{H_l W_l} \sum_{h,w} \text{Diff}_l(c, h, w)$$
       </li>
-      <li><strong>通道加权求和</strong>：使用该层预先训练好的权重向量 \(\mathbf{w}_l\)（长度也为 \(C_l\)）与 \(\mathbf{d}_l\) 做点乘，得到该层的感知距离：
-        \[
-        d_l = \mathbf{w}_l \cdot \mathbf{d}_l = \sum_{c=1}^{C_l} w_l^c \cdot d_l^c
-        \]
-        权重 \(w_l^c\) 反映了第 \(l\) 层第 \(c\) 个通道对人类感知的重要程度。
+      <li>通道加权求和：用该层预先训练好的权重向量 $\mathbf{w}_l$ 与 $\mathbf{d}_l$ 做点积，得到该层的感知距离：
+        $$d_l = \mathbf{w}_l \cdot \mathbf{d}_l = \sum_{c=1}^{C_l} w_l^c \cdot d_l^c$$
       </li>
     </ol>
   </li>
-  <li>
-    <strong>跨层求和</strong>：将所有层计算出的距离直接相加，得到最终 LPIPS 分数：
-    \[
-    \text{LPIPS}(x, x_0) = \sum_{l=1}^{L} d_l
-    \]
-    通常 \(L = 5\)（AlexNet 的 conv1 到 conv5）。
+  <li><strong>跨层求和</strong>：将所有层的距离相加得到最终 LPIPS 分数：
+    $$\text{LPIPS}(x, x_0) = \sum_{l=1}^{L} d_l$$
+    通常 $L = 5$（AlexNet 的 conv1 至 conv5）。
   </li>
 </ol>
 
-<p><strong>注意</strong>：整个计算过程中，<strong>特征提取网络完全冻结，没有任何可训练参数</strong>；唯一可训练的是各层的通道权重 \(\mathbf{w}_l\)，这些权重在训练阶段已确定，推理时直接使用。</p>
+<div class="note">
+  <strong>关键点</strong>：特征提取网络完全冻结，<strong>只有通道权重 $\mathbf{w}_l$ 是可学习的参数</strong>，这些权重通过训练得到，推理时直接使用。
+</div>
 
 <!-- ================== 训练方法 ================== -->
 <h2>三、训练方法</h2>
 
-<h3>3.1 训练数据</h3>
-<p>训练数据来源于人类主观判断数据库，最常用的是 <strong>BAPPS (Berkeley Adobe Perceptual Patch Similarity)</strong>。数据格式为<strong>三元组</strong>：</p>
+<h3>3.1 训练数据：BAPPS 数据库</h3>
+<p>训练数据采用<strong>三元组</strong>形式，来自人类 2AFC（二选一强迫选择）实验：</p>
 <ul>
-  <li>参考图像 \(x\)</li>
-  <li>两张失真/处理后图像 \(x_A\) 和 \(x_B\)</li>
-  <li>人类标签 \(y\)：\(y=1\) 表示人类认为 \(x_A\) 比 \(x_B\) 更像 \(x\)；\(y=0\) 则相反。</li>
+  <li>参考图 $x$</li>
+  <li>两张失真图 $x_A$ 和 $x_B$</li>
+  <li>人类标签 $y \in \{0,1\}$：$y=1$ 表示人认为 $x_A$ 比 $x_B$ 更像 $x$；$y=0$ 则相反。</li>
 </ul>
-<p>这种收集方式称为 2AFC（二选一强迫选择），避免了对绝对分数的标尺依赖。</p>
+<p>这种方式避免了绝对评分的不稳定性，人类只需判断“谁更像”。</p>
 
 <h3>3.2 训练流程</h3>
-<p>训练目标是学习各层的通道权重 \(\mathbf{w}_l\)，使得模型输出的距离相对大小与人类判断一致。</p>
-
 <ol>
-  <li><strong>前向传播，计算两个距离</strong>：
-    将 \(x, x_A, x_B\) 分别送入同一个特征提取网络，按第二章的步骤计算出两个感知距离：
-    \[
-    d_A = \text{LPIPS}(x, x_A), \quad d_B = \text{LPIPS}(x, x_B)
-    \]
+  <li><strong>前向传播</strong>：对每一组训练样本 $(x, x_A, x_B, y)$，分别计算两个距离：
+    $$d_A = \text{LPIPS}(x, x_A), \quad d_B = \text{LPIPS}(x, x_B)$$
   </li>
-  <li><strong>将距离差转化为概率</strong>：
-    用 Sigmoid 函数将两个距离的差映射为“模型认为 A 更近”的概率：
-    \[
-    \hat{p} = \frac{e^{-d_A}}{e^{-d_A} + e^{-d_B}} = \sigma(d_B - d_A)
-    \]
-    当 \(d_A < d_B\) 时，\(d_B - d_A > 0\)，\(\hat{p} > 0.5\)，模型倾向于 A 更像原图。
+  <li><strong>转化为概率</strong>：用 Sigmoid 函数将距离差映射为“A 更近”的概率：
+    $$\hat{p} = \frac{e^{-d_A}}{e^{-d_A} + e^{-d_B}} = \sigma(d_B - d_A)$$
+    若 $d_A < d_B$，则 $\hat{p} > 0.5$，模型倾向于 A 更像原图。
   </li>
-  <li><strong>计算损失</strong>：
-    使用二元交叉熵损失，使 \(\hat{p}\) 逼近真实的人类标签 \(y\)：
-    \[
-    \mathcal{L} = -y \log(\hat{p}) - (1-y) \log(1-\hat{p})
-    \]
+  <li><strong>计算损失</strong>：二元交叉熵损失，使预测概率 $\hat{p}$ 逼近真实标签 $y$：
+    $$\mathcal{L} = -y \log(\hat{p}) - (1-y) \log(1-\hat{p})$$
   </li>
-  <li><strong>反向传播，更新权重</strong>：
-    损失仅对通道权重 \(\mathbf{w}_l\) 求导（特征提取网络冻结），使用 SGD 或 Adam 优化器更新权重。
-  </li>
+  <li><strong>反向传播</strong>：损失仅对通道权重 $\mathbf{w}_l$ 求导，特征提取网络保持冻结。使用 Adam 或 SGD 更新权重。</li>
 </ol>
 
-<h3>3.3 训练细节</h3>
+<h3>3.3 训练细节与技巧</h3>
 <ul>
-  <li><strong>网络选择</strong>：常用 AlexNet 或 VGG16，在 ImageNet 上预训练。</li>
-  <li><strong>层数</strong>：通常取 5 个中间层（AlexNet 的 conv1～conv5）。</li>
-  <li><strong>权重初始化</strong>：各层通道权重初始化为 1 或均匀值，表示所有通道同等重要。</li>
-  <li><strong>训练规模</strong>：BAPPS 包含数万对训练样本，足以训练稳定的权重。</li>
-  <li><strong>最终效果</strong>：训练好的权重在不同数据集和失真类型上泛化良好，LPIPS 与人类 MOS 的相关系数显著高于 PSNR/SSIM。</li>
+  <li><strong>网络选择</strong>：常用 AlexNet（轻量）或 VGG（更准），均在 ImageNet 上预训练。</li>
+  <li><strong>层数</strong>：取 5 个中间层（如 AlexNet 的 conv1～conv5），兼顾浅层纹理和深层语义。</li>
+  <li><strong>权重初始化</strong>：所有通道权重初始化为 1，即初始时退化为简单的通道平均差异。</li>
+  <li><strong>参数量</strong>：AlexNet 版本仅约数千个参数，训练极快且不易过拟合。</li>
 </ul>
 
 <h3>3.4 为什么只训练通道权重？</h3>
-<p>特征提取网络已经具备强大的层次化视觉特征；我们只需学习“当某一层、某一通道的特征发生多大变化时，人眼会认为‘不像’”。这种设计参数量极少（AlexNet 版本仅约几千个参数），训练快速且不易过拟合，同时保留了特征空间的固有感知结构。</p>
+<p>预训练的分类网络已经具备了强大的视觉特征层次结构，直接修改卷积核会破坏这种特性。我们只需要学习“当第 $l$ 层的第 $c$ 个通道发生多大变化时，人眼会敏感”即可。这相当于在固定特征空间上学习一个最优的感知度量，既保留了泛化性，又针对人类感知进行了校准。</p>
 
-<h2>四、使用与评价</h2>
-<p>训练完成后，推理时直接调用固定的网络和权重，输入参考图和待测图即可得到距离分数。该分数越小表示感知质量越好。在超分辨率、图像压缩、去噪等任务中，LPIPS 已成为最受认可的感知质量指标之一。</p>
+<h2>四、总结与应用</h2>
+<ul>
+  <li><strong>推理使用</strong>：直接输入参考图和待测图，输出一个距离值（越小越好）。</li>
+  <li><strong>典型场景</strong>：图像超分辨率、压缩、去噪、风格迁移等的感知质量评估。</li>
+  <li><strong>常用实现</strong>：Python 的 <code>lpips</code> 库，一行代码即可计算。</li>
+</ul>
 
 <hr>
-<p style="text-align:right; color:#888;">文档基于 LPIPS 论文（Zhang et al., CVPR 2018）及相关解读整理</p>
+<p style="text-align:right; color:#888;">文档基于 LPIPS 论文（Zhang et al., CVPR 2018）及相关开源实现整理</p>
 
 </body>
 </html>
