@@ -1,0 +1,369 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>图像质量评价：PSNR 与 SSIM 的完整解析</title>
+  <style>
+    body {
+      font-family: "Microsoft YaHei", "Helvetica Neue", Arial, sans-serif;
+      max-width: 900px;
+      margin: 40px auto;
+      padding: 0 20px;
+      line-height: 1.8;
+      color: #333;
+    }
+    h1 { font-size: 2em; border-bottom: 2px solid #4CAF50; padding-bottom: 0.3em; }
+    h2 { font-size: 1.5em; margin-top: 1.5em; border-bottom: 1px solid #ddd; }
+    h3 { font-size: 1.2em; margin-top: 1.2em; }
+    p { margin: 1em 0; }
+    table {
+      border-collapse: collapse;
+      width: 100%;
+      margin: 1.5em 0;
+    }
+    th, td {
+      border: 1px solid #ccc;
+      padding: 10px 15px;
+      text-align: left;
+    }
+    th {
+      background-color: #f2f2f2;
+      font-weight: bold;
+    }
+    code {
+      background-color: #f4f4f4;
+      padding: 2px 6px;
+      border-radius: 4px;
+      font-family: Consolas, "Courier New", monospace;
+    }
+    pre {
+      background: #f8f8f8;
+      padding: 15px;
+      border: 1px solid #ddd;
+      border-radius: 6px;
+      overflow-x: auto;
+    }
+    blockquote {
+      border-left: 4px solid #4CAF50;
+      padding-left: 20px;
+      color: #555;
+      margin: 1em 0;
+    }
+    img {
+      display: block;
+      margin: 10px auto;
+      max-width: 100%;
+    }
+    .math-block {
+      overflow-x: auto;
+      padding: 10px 0;
+    }
+  </style>
+  <!-- 引入 MathJax 3 用于渲染 LaTeX 公式 -->
+  <script>
+    MathJax = {
+      tex: {
+        inlineMath: [['\\(', '\\)']],
+        displayMath: [['$$', '$$']],
+        processEscapes: true
+      }
+    };
+  </script>
+  <script src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+</head>
+<body>
+
+<h1>图像质量评价：PSNR 与 SSIM 的完整解析</h1>
+
+<!-- ================== PSNR 部分 ================== -->
+<h2>一、PSNR（峰值信噪比）</h2>
+
+<h3>1.1 核心思想</h3>
+<p>PSNR 衡量的是两幅图像<strong>逐像素的绝对误差</strong>。它完全不关心图像内容或人类视觉感知，只看对应位置像素值“差了多少”，误差越大分数越低。</p>
+
+<h3>1.2 计算过程</h3>
+<p>设参考图像为 \(I\)，待测图像为 \(K\)，尺寸均为 \(m \times n\)，像素值范围 \(0 \sim 255\)。</p>
+
+<p><strong>第一步：计算均方误差 MSE</strong></p>
+<div class="math-block">
+$$
+\text{MSE} = \frac{1}{mn} \sum_{i=0}^{m-1} \sum_{j=0}^{n-1} \big[ I(i,j) - K(i,j) \big]^2
+$$
+</div>
+
+<p><strong>第二步：映射到对数分贝尺度</strong></p>
+<div class="math-block">
+$$
+\text{PSNR} = 10 \cdot \log_{10} \left( \frac{\text{MAX}^2}{\text{MSE}} \right)
+$$
+</div>
+
+<ul>
+  <li>\(\text{MAX} = 255\)（8-bit 图像）</li>
+  <li>当 \(\text{MSE} \to 0\)（两图完全相同）时，\(\text{PSNR} \to \infty\)，实际代码会设上限。</li>
+</ul>
+
+<p><strong>彩色图像处理方式：</strong></p>
+<ul>
+  <li>分别计算 R、G、B 三通道 MSE，取平均后代入公式（最常用）。</li>
+  <li>或转为 YCbCr，仅计算亮度 Y 通道的 PSNR（论文常见，更贴近感知）。</li>
+</ul>
+
+<h3>1.3 计算示例</h3>
+<p>假设一个 \(2\times 2\) 块，参考图 R 和超分图 T：</p>
+<div class="math-block">
+$$
+R = \begin{bmatrix} 200 & 50 \\ 180 & 60 \end{bmatrix} \quad
+T = \begin{bmatrix} 202 & 52 \\ 178 & 58 \end{bmatrix}
+$$
+</div>
+
+<p><strong>MSE 计算：</strong></p>
+<div class="math-block">
+$$
+\begin{aligned}
+\text{MSE} &= \frac{1}{4} \big[ (200-202)^2 + (50-52)^2 + (180-178)^2 + (60-58)^2 \big] \\
+&= \frac{1}{4} \big[ (-2)^2 + (-2)^2 + 2^2 + 2^2 \big] \\
+&= \frac{1}{4} \times (4+4+4+4) = \frac{16}{4} = 4.0
+\end{aligned}
+$$
+</div>
+
+<p><strong>PSNR：</strong></p>
+<div class="math-block">
+$$
+\text{PSNR} = 10 \cdot \log_{10} \left( \frac{255^2}{4.0} \right) = 10 \cdot \log_{10} \left( \frac{65025}{4} \right) \approx 42.1 \text{ dB}
+$$
+</div>
+
+<p><strong>敏感性示例（平移一个像素）：</strong><br>
+若 T 相对于 R 发生整体平移，例如 T 变为：</p>
+<div class="math-block">
+$$
+T_{\text{shift}} = \begin{bmatrix} 60 & 200 \\ 50 & 180 \end{bmatrix}
+$$
+</div>
+<p>原对应像素完全错位，MSE 将极大增加，PSNR 断崖式下降，尽管视觉内容可能高度相似。</p>
+
+
+<!-- ================== SSIM 部分 ================== -->
+<h2>二、SSIM（结构相似性）</h2>
+
+<h3>2.1 核心思想</h3>
+<p>SSIM 模仿人眼对图像结构的感知，认为<strong>亮度、对比度、结构纹理</strong>是评价相似度的三个独立维度。其设计哲学是：</p>
+<ul>
+  <li>对整体亮度和对比度的变化宽容（人脑会自动适应）；</li>
+  <li>对结构纹理的破坏极其敏感（一旦边缘模糊或纹理错位，立即察觉）。</li>
+</ul>
+<p>SSIM 在<strong>局部滑动窗口</strong>（如 \(11\times11\)）上分别计算三个分量的相似度，然后合并，最终整图取所有窗口的平均值。</p>
+
+<h3>2.2 三个分量与整体公式</h3>
+<p>对于窗口 \(x\)（参考）和 \(y\)（待测）：</p>
+
+<p><strong>亮度比较：</strong></p>
+<div class="math-block">
+$$
+l(x,y) = \frac{2\mu_x \mu_y + C_1}{\mu_x^2 + \mu_y^2 + C_1}
+$$
+</div>
+<p>\(\mu_x, \mu_y\) 为窗口均值，\(C_1 = (K_1 L)^2\)，\(L=255\)，\(K_1 \ll 1\)。</p>
+
+<p><strong>对比度比较：</strong></p>
+<div class="math-block">
+$$
+c(x,y) = \frac{2\sigma_x \sigma_y + C_2}{\sigma_x^2 + \sigma_y^2 + C_2}
+$$
+</div>
+<p>\(\sigma_x, \sigma_y\) 为窗口标准差（对比度），\(C_2 = (K_2 L)^2\)。</p>
+
+<p><strong>结构比较：</strong><br>
+先去除亮度和对比度的影响，比较归一化后的模式相关性，本质是计算<strong>互相关系数</strong>：</p>
+<div class="math-block">
+$$
+s(x,y) = \frac{\sigma_{xy} + C_3}{\sigma_x \sigma_y + C_3}
+$$
+</div>
+<p>\(\sigma_{xy}\) 为 \(x\) 和 \(y\) 的协方差，\(C_3 = C_2 / 2\)。</p>
+
+<p><strong>窗口 SSIM 合并：</strong></p>
+<div class="math-block">
+$$
+\text{SSIM}(x,y) = [l(x,y)]^\alpha \cdot [c(x,y)]^\beta \cdot [s(x,y)]^\gamma
+$$
+</div>
+<p>通常取 \(\alpha=\beta=\gamma=1\)，简化为：</p>
+<div class="math-block">
+$$
+\text{SSIM}(x,y) = \frac{(2\mu_x\mu_y + C_1)(2\sigma_{xy} + C_2)}{(\mu_x^2 + \mu_y^2 + C_1)(\sigma_x^2 + \sigma_y^2 + C_2)}
+$$
+</div>
+<p>取值范围 \([-1,1]\)，<strong>越接近 1 越相似</strong>。</p>
+
+<h3>2.3 结构计算详解（协方差与互相关系数）</h3>
+<p>结构分量是 SSIM 的灵魂，它量化的是<strong>去均值后像素起伏模式</strong>的一致性。</p>
+<p><strong>步骤：</strong></p>
+<ol>
+  <li>对两窗口分别减去自身均值，得到“零均值图” \(x' = x - \mu_x\)，\(y' = y - \mu_y\)；</li>
+  <li>计算协方差：
+    <div class="math-block">$$\sigma_{xy} = \frac{1}{N-1} \sum_{i=1}^{N} x'_i \cdot y'_i$$</div>
+  </li>
+  <li>归一化为互相关系数：
+    <div class="math-block">$$\rho = \frac{\sigma_{xy}}{\sigma_x \sigma_y}$$</div>
+    如果去均值后两窗口的正负号分布完全一致，\(\rho \to 1\)；若亮暗完全颠倒，\(\rho \to -1\)。</li>
+</ol>
+
+<h3>2.4 完整计算示例</h3>
+<p>以下用 \(2\times2\) 块详细演示（为直观使用简化数值，实际计算中常数 \(C_1,C_2\) 取小正值，此处忽略以凸显核心机制）。</p>
+
+<p><strong>参考图 R</strong>（纹理清晰）：</p>
+<div class="math-block">
+$$
+R = \begin{bmatrix} 200 & 50 \\ 180 & 60 \end{bmatrix}
+$$
+</div>
+<p><strong>超分图 T</strong>（模糊但纹理方向保留）：</p>
+<div class="math-block">
+$$
+T = \begin{bmatrix} 150 & 80 \\ 140 & 90 \end{bmatrix}
+$$
+</div>
+
+<h4>(1) 亮度分量</h4>
+<ul>
+  <li>\(\mu_R = (200+50+180+60)/4 = 122.5\)</li>
+  <li>\(\mu_T = (150+80+140+90)/4 = 115.0\)</li>
+</ul>
+<p>代入公式（忽略常数）：</p>
+<div class="math-block">
+$$
+l \approx \frac{2\times 122.5\times 115.0}{122.5^2 + 115.0^2} \approx 0.995
+$$
+</div>
+
+<h4>(2) 对比度分量</h4>
+<p>先计算各自标准差（对比度）：</p>
+<p>R 的去均值图：</p>
+<div class="math-block">
+$$
+R' = \begin{bmatrix} 77.5 & -72.5 \\ 57.5 & -62.5 \end{bmatrix}
+$$
+</div>
+<p>平方和 = 18475，方差 = 6158.33，\(\sigma_R \approx 78.47\)。</p>
+
+<p>T 的去均值图：</p>
+<div class="math-block">
+$$
+T' = \begin{bmatrix} 35 & -35 \\ 25 & -25 \end{bmatrix}
+$$
+</div>
+<p>平方和 = 3700，方差 = 1233.33，\(\sigma_T \approx 35.12\)。</p>
+
+<p>对比度相似度：</p>
+<div class="math-block">
+$$
+c \approx \frac{2\times 78.47\times 35.12}{78.47^2 + 35.12^2} \approx 0.716
+$$
+</div>
+<p>（对比度从 78.47 降至 35.12，该项被明显扣分）</p>
+
+<h4>(3) 结构分量</h4>
+<p>将 R' 和 T' 对应元素相乘：</p>
+<div class="math-block">
+$$
+\begin{aligned}
+77.5\times35 &= 2712.5 \\
+-72.5\times(-35) &= 2537.5 \\
+57.5\times25 &= 1437.5 \\
+-62.5\times(-25) &= 1562.5
+\end{aligned}
+$$
+</div>
+<p>乘积和 = 8250，协方差 \(\sigma_{RT} = 8250/3 = 2750.0\)。</p>
+
+<p>互相关系数（结构相似度）：</p>
+<div class="math-block">
+$$
+\rho = \frac{2750.0}{78.47\times 35.12} \approx 0.998
+$$
+</div>
+<p>纹理走向几乎完全一致。</p>
+
+<h4>(4) 总体 SSIM</h4>
+<p>约等于三者的乘积：</p>
+<div class="math-block">
+$$
+\text{SSIM} \approx 0.995 \times 0.716 \times 0.998 \approx 0.711
+$$
+</div>
+<blockquote><strong>解读</strong>：尽管结构保留极好，但因对比度大幅下降，整体 SSIM 被拉低。</blockquote>
+
+<h4>极端对比：结构错位（平移）</h4>
+<p>设 T 变为平移版本：</p>
+<div class="math-block">
+$$
+T_{\text{shift}} = \begin{bmatrix} 60 & 200 \\ 50 & 180 \end{bmatrix}
+$$
+</div>
+<ul>
+  <li>亮度和对比度可能与 R 相同或接近（均值 122.5，标准差 78.47），故 \(l \approx 1\)，\(c \approx 1\)。</li>
+  <li>但去均值图与 R' 的乘积出现大量负值，协方差 \(\sigma_{RT} \approx -6075\)，互相关系数 \(\rho \approx -0.986\)。</li>
+  <li>结构项 \(s \to 0\)，最终 <strong>SSIM 骤降至接近 0</strong>。</li>
+</ul>
+<p>这解释了为何 SSIM 对平移极度敏感：虽然人眼不觉得“画面内容”有损，但像素排列模式的相关系数已接近 -1。</p>
+
+
+<!-- ================== 对比总结 ================== -->
+<h2>三、PSNR vs SSIM 总结对比</h2>
+
+<table>
+  <thead>
+    <tr>
+      <th>维度</th>
+      <th>PSNR</th>
+      <th>SSIM</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><strong>核心依赖</strong></td>
+      <td>像素差平方的均值</td>
+      <td>局部区域的亮度、对比度、结构相关性</td>
+    </tr>
+    <tr>
+      <td><strong>对平移的响应</strong></td>
+      <td>极敏感（分数暴降）</td>
+      <td>极敏感（结构相关系数直接崩溃）</td>
+    </tr>
+    <tr>
+      <td><strong>对整体亮度变化</strong></td>
+      <td>敏感（直接增加 MSE）</td>
+      <td>宽容（亮度项可接近 1，只要均值相对一致）</td>
+    </tr>
+    <tr>
+      <td><strong>对对比度减弱</strong></td>
+      <td>敏感</td>
+      <td>会通过对比度项适当扣分</td>
+    </tr>
+    <tr>
+      <td><strong>对纹理模糊</strong></td>
+      <td>往往误差较小（若像素值接近），可能误判高分</td>
+      <td>通过结构项严格检测纹理模式的保持度</td>
+    </tr>
+    <tr>
+      <td><strong>与人眼感知一致性</strong></td>
+      <td>差，经常出现“PSNR 高分但图更难看”</td>
+      <td>较好，但平移等场景仍有局限</td>
+    </tr>
+    <tr>
+      <td><strong>推荐用途</strong></td>
+      <td>基础的保真度底线，必须报告</td>
+      <td>作为补充，关注结构失真</td>
+    </tr>
+  </tbody>
+</table>
+
+<p><strong>现代实践中，通常两者联合使用，并辅以 LPIPS 等深度特征感知指标，才能全面评价图像质量。</strong></p>
+
+</body>
+</html>
