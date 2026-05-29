@@ -3,19 +3,19 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>图像质量评价：PSNR 与 SSIM 的完整解析</title>
+  <title>图像质量评价：PSNR / SSIM / MS-SSIM 完整解析</title>
   <style>
     body {
       font-family: "Microsoft YaHei", "Helvetica Neue", Arial, sans-serif;
-      max-width: 900px;
+      max-width: 960px;
       margin: 40px auto;
       padding: 0 20px;
       line-height: 1.8;
       color: #333;
     }
     h1 { font-size: 2em; border-bottom: 2px solid #4CAF50; padding-bottom: 0.3em; }
-    h2 { font-size: 1.5em; margin-top: 1.5em; border-bottom: 1px solid #ddd; }
-    h3 { font-size: 1.2em; margin-top: 1.2em; }
+    h2 { font-size: 1.5em; margin-top: 1.8em; border-bottom: 1px solid #ddd; }
+    h3 { font-size: 1.2em; margin-top: 1.3em; }
     p { margin: 1em 0; }
     table {
       border-collapse: collapse;
@@ -50,11 +50,6 @@
       color: #555;
       margin: 1em 0;
     }
-    img {
-      display: block;
-      margin: 10px auto;
-      max-width: 100%;
-    }
     .math-block {
       overflow-x: auto;
       padding: 10px 0;
@@ -74,7 +69,7 @@
 </head>
 <body>
 
-<h1>图像质量评价：PSNR 与 SSIM 的完整解析</h1>
+<h1>图像质量评价：PSNR / SSIM / MS-SSIM 完整解析</h1>
 
 <!-- ================== PSNR 部分 ================== -->
 <h2>一、PSNR（峰值信噪比）</h2>
@@ -313,8 +308,145 @@ $$
 <p>这解释了为何 SSIM 对平移极度敏感：虽然人眼不觉得“画面内容”有损，但像素排列模式的相关系数已接近 -1。</p>
 
 
-<!-- ================== 对比总结 ================== -->
-<h2>三、PSNR vs SSIM 总结对比</h2>
+<!-- ================== MS-SSIM 部分 ================== -->
+<h2>三、MS-SSIM（多尺度结构相似性）</h2>
+
+<h3>3.1 核心思想与改进</h3>
+<p>SSIM 在单一尺度下评估，就像用一个固定倍率的放大镜观察图像，无法同时兼顾细微纹理和整体结构。MS-SSIM 则通过构建<strong>图像金字塔</strong>，在多个分辨率下分别计算相似度，最后加权合成一个总分。这种多尺度策略更贴近人眼在不同观看距离下的感知特点。</p>
+
+<h3>3.2 计算流程</h3>
+<ol>
+  <li><strong>构建金字塔</strong>：将参考图和测试图作为尺度 1（原始尺寸），反复进行低通滤波和 2 倍下采样，得到尺度 2、尺度 3……尺度 M（最粗）。</li>
+  <li><strong>在各尺度计算相似度分量</strong>：
+    <ul>
+      <li><strong>亮度比较 \(l\)</strong>：<strong>仅在尺度 M</strong>（最顶层）计算一次，因为亮度属于全局信息。</li>
+      <li><strong>对比度比较 \(c_j\)</strong> 和 <strong>结构比较 \(s_j\)</strong>：在<strong>每一个尺度</strong> \(j=1 \dots M\) 上分别计算。细尺度捕捉纹理细节，粗尺度捕捉边缘轮廓。</li>
+    </ul>
+  </li>
+  <li><strong>加权合成</strong>：将所有分量以指数权重连乘，得到最终的 MS-SSIM 分数：
+    <div class="math-block">
+    $$
+    \text{MS-SSIM}(x,y) = [l_M(x,y)]^{\alpha_M} \cdot \prod_{j=1}^{M} [c_j(x,y)]^{\beta_j} [s_j(x,y)]^{\gamma_j}
+    $$
+    </div>
+    其中指数权重的总和为 1，保证满分仍为 1。
+  </li>
+</ol>
+
+<h3>3.3 权重如何确定？标准权重表</h3>
+<p>MS-SSIM 的权重并非任意指定，而是由指标创建者在大型主观质量数据库上，通过对数域线性回归训练得出的固定常数。所有严格使用标准实现的论文都采用同一套权重，因此不同论文的 MS-SSIM 分数可以直接比较。</p>
+<p>经典的 5 尺度权重如下（\(\alpha_M = 1\)，其余权重 \(\beta_j = \gamma_j\)）：</p>
+<table>
+  <thead>
+    <tr><th>尺度 \(j\)</th><th>图像尺寸（相对）</th><th>权重 \(\beta_j, \gamma_j\)</th></tr>
+  </thead>
+  <tbody>
+    <tr><td>1（最细，原图）</td><td>1</td><td>0.0448</td></tr>
+    <tr><td>2</td><td>1/2</td><td>0.2856</td></tr>
+    <tr><td>3</td><td>1/4</td><td>0.3001</td></tr>
+    <tr><td>4</td><td>1/8</td><td>0.2363</td></tr>
+    <tr><td>5（最粗）</td><td>1/16</td><td>0.1333</td></tr>
+  </tbody>
+</table>
+<p>可以看到，<strong>中间的尺度 2、3、4 获得了最高权重</strong>，因为它们对应人眼最敏感的边缘和轮廓信息，而最细的纹理和最粗的全局亮度权重较低。这个分布完美模拟了人类视觉系统的多通道特性。</p>
+
+<h3>3.4 完整计算示例（2 尺度 MS-SSIM）</h3>
+<p>为了手算演示，我们使用一个简化的 2 尺度版本。设参考图 <strong>R</strong> 和测试图 <strong>T</strong> 均为 \(4 \times 4\) 灰度图，像素范围 0–255。算法常数：\(L=255\)，\(C_1 = (0.01\times 255)^2 = 6.5025\)，\(C_2 = (0.03\times 255)^2 = 58.5225\)，\(C_3 = C_2/2 = 29.26125\)。</p>
+
+<p><strong>原始 4×4 图：</strong></p>
+<div class="math-block">
+$$
+R = \begin{bmatrix}
+10 & 20 & 30 & 40\\
+20 & 30 & 40 & 50\\
+30 & 40 & 50 & 60\\
+40 & 50 & 60 & 70
+\end{bmatrix}
+\quad
+T = \begin{bmatrix}
+15 & 20 & 25 & 30\\
+20 & 25 & 30 & 35\\
+25 & 30 & 35 & 40\\
+30 & 35 & 40 & 45
+\end{bmatrix}
+$$
+</div>
+<p>R 为清晰的对角渐变，T 为模糊后的平缓版本（数值更集中）。</p>
+
+<h4>尺度 1（原图 4×4）：计算 \(c_1\) 和 \(s_1\)</h4>
+<p>均值：\(\mu_R=40\)，\(\mu_T=30\)。<br>
+去均值图 \(R' = R-40\)，\(T' = T-30\)。计算标准差和协方差（分母 N-1=15）：</p>
+<ul>
+  <li>\(\sigma_R^2 = 4000/15 \approx 266.67\) → \(\sigma_R \approx 16.33\)</li>
+  <li>\(\sigma_T^2 = 1000/15 \approx 66.67\)  → \(\sigma_T \approx 8.165\)</li>
+  <li>\(\sigma_{RT} = 2000/15 \approx 133.33\)</li>
+</ul>
+<p>对比度比较：</p>
+<div class="math-block">
+$$
+c_1 = \frac{2\sigma_R\sigma_T + C_2}{\sigma_R^2 + \sigma_T^2 + C_2}
+     = \frac{2\times 16.33\times 8.165 + 58.52}{266.67 + 66.67 + 58.52}
+     \approx 0.830
+$$
+</div>
+<p>结构比较：由于 T' = 0.5 × R'，相关系数为 1，所以</p>
+<div class="math-block">
+$$
+s_1 = \frac{\sigma_{RT} + C_3}{\sigma_R\sigma_T + C_3} = 1.0
+$$
+</div>
+
+<h4>尺度 2：下采样到 2×2</h4>
+<p>用 2×2 平均池化进行下采样：</p>
+<div class="math-block">
+$$
+R_2 = \begin{bmatrix} 20 & 40 \\ 40 & 60 \end{bmatrix}
+\quad
+T_2 = \begin{bmatrix} 20 & 30 \\ 30 & 40 \end{bmatrix}
+$$
+</div>
+<p>此时将整个 2×2 作为一个窗口（N=4，分母 N-1=3）。<br>
+均值：\(\mu_{R2}=40\)，\(\mu_{T2}=30\)。</p>
+<p>去均值：\(R_2' = \begin{bmatrix} -20 & 0 \\ 0 & 20 \end{bmatrix}\)，\(T_2' = \begin{bmatrix} -10 & 0 \\ 0 & 10 \end{bmatrix}\)。</p>
+<ul>
+  <li>\(\sigma_{R2}^2 = (400+0+0+400)/3 \approx 266.67\) → \(\sigma_{R2} \approx 16.33\)</li>
+  <li>\(\sigma_{T2}^2 = (100+0+0+100)/3 \approx 66.67\)  → \(\sigma_{T2} \approx 8.165\)</li>
+  <li>协方差：\(\sigma_{RT2} = ( (-20)(-10)+0+0+20\times10 )/3 = 400/3 \approx 133.33\)</li>
+</ul>
+
+<p><strong>亮度比较（仅在此顶层计算）：</strong></p>
+<div class="math-block">
+$$
+l_2 = \frac{2\mu_{R2}\mu_{T2} + C_1}{\mu_{R2}^2 + \mu_{T2}^2 + C_1}
+     = \frac{2\times 40\times 30 + 6.5025}{1600 + 900 + 6.5025}
+     \approx 0.960
+$$
+</div>
+<p><strong>对比度比较：</strong></p>
+<div class="math-block">
+$$
+c_2 = \frac{2\sigma_{R2}\sigma_{T2} + C_2}{\sigma_{R2}^2 + \sigma_{T2}^2 + C_2}
+     \approx 0.830 \quad (\text{与 }c_1\text{ 相同})
+$$
+</div>
+<p><strong>结构比较：</strong>同样因为完美线性关系，\(s_2 = 1.0\)。</p>
+
+<h4>加权合成 MS-SSIM</h4>
+<p>为演示，定义 2 尺度权重：\(\beta_1=\gamma_1=0.4\)，\(\beta_2=\gamma_2=0.6\)，亮度指数 \(\alpha_2=1\)。权重和 = 1。</p>
+<div class="math-block">
+$$
+\begin{aligned}
+\text{MS-SSIM} &= [l_2]^{1} \cdot [c_1]^{0.4} [s_1]^{0.4} \cdot [c_2]^{0.6} [s_2]^{0.6} \\
+               &= 0.960 \times 0.830^{0.4+0.6} \times 1.0 \\
+               &= 0.960 \times 0.830 = 0.7968
+\end{aligned}
+$$
+</div>
+<p>本例中因结构完美且对比度变化在各尺度一致，MS-SSIM 分数与单尺度 SSIM 相同（0.7968）。但在真实图像中，若失真在不同尺度表现不同（例如细尺度纹理模糊但轮廓保留），MS-SSIM 会给出与 SSIM 明显不同的评价，且与主观感受更加吻合。</p>
+
+
+<!-- ================== 总结对比 ================== -->
+<h2>四、PSNR vs SSIM vs MS-SSIM 总结对比</h2>
 
 <table>
   <thead>
@@ -322,48 +454,62 @@ $$
       <th>维度</th>
       <th>PSNR</th>
       <th>SSIM</th>
+      <th>MS-SSIM</th>
     </tr>
   </thead>
   <tbody>
     <tr>
       <td><strong>核心依赖</strong></td>
       <td>像素差平方的均值</td>
-      <td>局部区域的亮度、对比度、结构相关性</td>
+      <td>局部亮度、对比度、结构相关性</td>
+      <td>多尺度下的对比度和结构，顶层亮度</td>
+    </tr>
+    <tr>
+      <td><strong>尺度感知</strong></td>
+      <td>单尺度（像素级）</td>
+      <td>单尺度（固定窗口）</td>
+      <td>多尺度（图像金字塔）</td>
     </tr>
     <tr>
       <td><strong>对平移的响应</strong></td>
       <td>极敏感（分数暴降）</td>
-      <td>极敏感（结构相关系数直接崩溃）</td>
+      <td>极敏感（结构相关系数崩溃）</td>
+      <td>敏感（各尺度结构项同时受影响）</td>
     </tr>
     <tr>
       <td><strong>对整体亮度变化</strong></td>
-      <td>敏感（直接增加 MSE）</td>
-      <td>宽容（亮度项可接近 1，只要均值相对一致）</td>
+      <td>敏感</td>
+      <td>宽容</td>
+      <td>宽容（亮度仅在顶层计算）</td>
     </tr>
     <tr>
       <td><strong>对对比度减弱</strong></td>
       <td>敏感</td>
-      <td>会通过对比度项适当扣分</td>
+      <td>适当扣分</td>
+      <td>在各尺度累计扣分，更全面</td>
     </tr>
     <tr>
       <td><strong>对纹理模糊</strong></td>
-      <td>往往误差较小（若像素值接近），可能误判高分</td>
-      <td>通过结构项严格检测纹理模式的保持度</td>
+      <td>可能误判高分</td>
+      <td>通过结构项检测</td>
+      <td>细尺度结构项惩罚模糊，粗尺度保持整体结构评价</td>
     </tr>
     <tr>
       <td><strong>与人眼感知一致性</strong></td>
-      <td>差，经常出现“PSNR 高分但图更难看”</td>
-      <td>较好，但平移等场景仍有局限</td>
+      <td>差</td>
+      <td>较好</td>
+      <td>优秀（在多数主观数据库上相关系数最高）</td>
     </tr>
     <tr>
       <td><strong>推荐用途</strong></td>
-      <td>基础的保真度底线，必须报告</td>
-      <td>作为补充，关注结构失真</td>
+      <td>基础保真底线</td>
+      <td>结构失真评估</td>
+      <td>需要最接近主观感受的客观评价（超分、压缩等）</td>
     </tr>
   </tbody>
 </table>
 
-<p><strong>现代实践中，通常两者联合使用，并辅以 LPIPS 等深度特征感知指标，才能全面评价图像质量。</strong></p>
+<p><strong>现代图像质量评价实践中，通常将 PSNR、SSIM、MS-SSIM 三者联合报告，并辅以 LPIPS 等深度特征感知指标，以获得既全面又可信的结论。</strong></p>
 
 </body>
 </html>
